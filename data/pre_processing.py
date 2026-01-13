@@ -5,6 +5,7 @@ import datetime
 from tqdm import tqdm
 import numpy as np
 import pandas as pd
+import unicodedata
 import re
 import warnings
 import matplotlib.pyplot as plt
@@ -193,22 +194,85 @@ def flatten_sales_json(df_raw: pd.DataFrame) -> pd.DataFrame:
 # -------------------------
 # Post processing and joins
 # -------------------------
-def clean_title(title: Optional[str]) -> Optional[str]:
-    """Normalize titles to lowercase alphanumeric only."""
-    if pd.isna(title) or title is None:
-        return None
-    title = str(title).lower()
-    return re.sub(r"[^a-z0-9]", "", title)
 
+def clean_title(title):
+    """
+    Produce a compact lowercase alphanumeric-only key for a title.
+    Returns None for missing input.
+    """
+    if title is None or (isinstance(title, float) and np.isnan(title)):
+        return None
+    s = str(title)
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    s = s.lower()
+    return re.sub(r"[^a-z0-9]", "", s)
+
+def make_title_label(title, max_len=60):
+    """
+    Produce a readable label for hover/visualization:
+    - trims whitespace, collapses internal spaces, truncates with ellipsis.
+    Returns None for missing input.
+    """
+    if title is None or (isinstance(title, float) and np.isnan(title)):
+        return None
+    s = str(title).strip()
+    s = re.sub(r"\s+", " ", s)
+    if len(s) > max_len:
+        return s[: max_len - 1].rstrip() + "…"
+    return s
 
 def load_metadata_and_titles(conn: sqlite3.Connection) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Load film_metadata and indian_titles tables from DB and clean titles."""
+    """Load film_metadata and indian_titles tables from database and add cleaned title columns."""
     df_titles = pd.read_sql("SELECT * FROM indian_titles;", conn)
     df_meta = pd.read_sql("SELECT * FROM film_metadata;", conn)
 
-    df_titles["title"] = df_titles["title"].apply(clean_title)
-    df_meta["title"] = df_meta["title"].apply(clean_title)
+    # Ensure title column exists
+    if 'title' not in df_titles.columns:
+        df_titles['title'] = None
+    if 'title' not in df_meta.columns:
+        df_meta['title'] = None
+
+    # Add cleaned and label columns (preserve original title)
+    df_titles['title_clean'] = df_titles['title'].apply(clean_title)
+    df_titles['title_label'] = df_titles['title'].apply(make_title_label)
+
+    df_meta['title_clean'] = df_meta['title'].apply(clean_title)
+    df_meta['title_label'] = df_meta['title'].apply(make_title_label)
+
     return df_meta, df_titles
+
+def join_sales_metadata(sales_df: pd.DataFrame, df_meta: pd.DataFrame, df_titles: pd.DataFrame) -> pd.DataFrame:
+    """Join sales to metadata and titles, and add derived date columns."""
+    for df in (df_meta, df_titles):
+        if 'title' not in df.columns:
+            df['title'] = None
+        if 'title_clean' not in df.columns:
+            df['title_clean'] = df['title'].apply(clean_title)
+        if 'title_label' not in df.columns:
+            df['title_label'] = df['title'].apply(make_title_label)
+
+    # merge metadata and titles on title_clean
+    meta_plus_titles = df_meta.merge(
+        df_titles[['title_clean', 'title', 'title_label']].rename(columns={'title': 'title_from_titles', 'title': 'title_from_titles'}),
+        on='title_clean',
+        how='left',
+        suffixes=('', '_titles')
+    )
+
+    # merge metadata
+    df = sales_df.merge(meta_plus_titles, on='numero_film_id', how='left')
+
+    # derived date columns and cleanups 
+    df["actual_sales_date"] = pd.to_datetime(df["actual_sales_date"])
+    df["week_start_date"] = pd.to_datetime(df["week_start_date"])
+    df["month"] = df["actual_sales_date"].dt.to_period("M").dt.to_timestamp()
+    df["dow"] = df["actual_sales_date"].dt.dayofweek
+    df["week_offset"] = (df["actual_sales_date"] - df["week_start_date"]).dt.days
+    df["is_weekend_numero"] = df["week_offset"].between(0, 3)
+    df["theatre_name"] = df["theatre_name"].str.replace(r"\s\d+$", "", regex=True).str.strip()
+
+    return df
 
 
 def join_sales_metadata(sales_df: pd.DataFrame, df_meta: pd.DataFrame, df_titles: pd.DataFrame) -> pd.DataFrame:
@@ -296,7 +360,7 @@ def extract_longest_continuous_run(df: pd.DataFrame, gap_days: int = 7) -> pd.Da
     df_run['day'] = (df_run['actual_sales_date'] - df_run['first_date']).dt.days + 1
     df_run['week'] = (df_run['day'] - 1) // 7 + 1
 
-    return df_run
+    return df_run, longest, segments, tmp, film_dates
 
 # -------------------------
 # Convenience functions
