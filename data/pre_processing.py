@@ -225,6 +225,80 @@ def join_sales_metadata(sales_df: pd.DataFrame, df_meta: pd.DataFrame, df_titles
     df["theatre_name"] = df["theatre_name"].str.replace(r"\s\d+$", "", regex=True).str.strip()
     return df
 
+def extract_longest_continuous_run(df: pd.DataFrame, gap_days: int = 7) -> pd.DataFrame:
+    """
+    Identify continuous segments per film and return df_run containing the longest continuous run.
+    """
+    # ensure date column is datetime
+    df['actual_sales_date'] = pd.to_datetime(df['actual_sales_date'])
+    dataset_end_date = df['actual_sales_date'].max()
+
+    # film-level first/last and duration/event flags (keeps your film_dates variable)
+    film_dates = (
+        df.groupby('numero_film_id', as_index=False)
+          .agg(first_date=('actual_sales_date', 'min'), last_date=('actual_sales_date', 'max'))
+    )
+    film_dates['duration_days'] = (film_dates['last_date'] - film_dates['first_date']).dt.days + 1
+    film_dates['event_observed'] = (film_dates['last_date'] < dataset_end_date).astype(int)
+
+    # prepare per-day rows per film
+    tmp = (
+        df[['numero_film_id', 'actual_sales_date']]
+        .drop_duplicates()
+        .sort_values(['numero_film_id', 'actual_sales_date'])
+        .copy()
+    )
+
+    tmp['prev_date'] = tmp.groupby('numero_film_id')['actual_sales_date'].shift(1)
+    tmp['gap'] = (tmp['actual_sales_date'] - tmp['prev_date']).dt.days.fillna(0)
+    tmp['new_segment'] = (tmp['gap'] > gap_days).astype(int)
+    tmp['segment_id'] = tmp.groupby('numero_film_id')['new_segment'].cumsum()
+
+    segments = (
+        tmp.groupby(['numero_film_id', 'segment_id'], as_index=False)
+           .agg(seg_start=('actual_sales_date', 'min'),
+                seg_end=('actual_sales_date', 'max'))
+    )
+
+    segments['seg_days'] = (segments['seg_end'] - segments['seg_start']).dt.days + 1
+
+    longest = (
+        segments.groupby('numero_film_id')['seg_days']
+                .max()
+                .rename('run_days_longest')
+                .reset_index()
+    )
+
+    # remove any existing run_days_longest columns in df to avoid duplicates
+    cols_to_drop = [c for c in df.columns if c.startswith('run_days_longest')]
+    if cols_to_drop:
+        df = df.drop(columns=cols_to_drop)
+
+    df = df.merge(longest, on='numero_film_id', how='left')
+
+    # attach segment_id for each actual_sales_date
+    df = df.merge(tmp[['numero_film_id', 'actual_sales_date', 'segment_id']],
+                  on=['numero_film_id', 'actual_sales_date'], how='left')
+
+    # find the longest segment id per film
+    longest_seg = (
+        segments.sort_values(['numero_film_id', 'seg_days'], ascending=[True, False])
+                .drop_duplicates('numero_film_id')[['numero_film_id', 'segment_id']]
+                .rename(columns={'segment_id': 'longest_segment'})
+    )
+
+    df = df.merge(longest_seg, on='numero_film_id', how='left')
+
+    # filtered dataset: only rows that belong to the longest continuous run
+    df_run = df[df['segment_id'] == df['longest_segment']].copy()
+
+    # ensure datetime and compute run-relative fields
+    df_run['actual_sales_date'] = pd.to_datetime(df_run['actual_sales_date'])
+    df_run['first_date'] = df_run.groupby('numero_film_id')['actual_sales_date'].transform('min')
+    df_run['day'] = (df_run['actual_sales_date'] - df_run['first_date']).dt.days + 1
+    df_run['week'] = (df_run['day'] - 1) // 7 + 1
+
+    return df_run
 
 # -------------------------
 # Convenience functions
