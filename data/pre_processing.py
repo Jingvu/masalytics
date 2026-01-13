@@ -226,9 +226,7 @@ def join_sales_metadata(sales_df: pd.DataFrame, df_meta: pd.DataFrame, df_titles
     return df
 
 def extract_longest_continuous_run(df: pd.DataFrame, gap_days: int = 7) -> pd.DataFrame:
-    """
-    Identify continuous segments per film and return df_run containing the longest continuous run.
-    """
+    """Identify continuous segments per film and return df_run containing the longest continuous run."""
     # ensure date column is datetime
     df['actual_sales_date'] = pd.to_datetime(df['actual_sales_date'])
     dataset_end_date = df['actual_sales_date'].max()
