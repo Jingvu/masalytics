@@ -1,0 +1,642 @@
+---
+title: "QUESTION 3: Which release windows are most vulnerable without a blockbuster anchor?"
+format:
+  html:
+    page-layout: full
+    embed-resources: true
+    toc: true
+    grid:
+      body-width: 1200px
+jupyter: python3
+echo: false
+warning: false
+---
+
+
+```{python}
+#| output: false
+import importlib
+import pre_processing as prep
+import sqlite3
+import json
+import datetime
+from tqdm import tqdm
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import matplotlib.ticker as ticker
+import matplotlib.dates as mdates
+import plotly.express as px
+from plotly.subplots import make_subplots
+import plotly.graph_objects as go
+from lifelines import KaplanMeierFitter
+from typing import Optional
+
+conn = prep.connect_db("numero_data.sqlite")
+
+# Load raw json
+df_raw = prep.load_raw_sales(conn)
+df_sales = prep.flatten_sales_json(df_raw)
+prep.save_df_to_csv(df_sales, "sales_processed.csv")
+
+# Dataset
+df_meta, df_titles = prep.load_metadata_and_titles(conn) 
+df = prep.join_sales_metadata(df_sales, df_meta, df_titles)
+df_run, longest, segments, tmp, film_dates = prep.extract_longest_continuous_run(df, gap_days=7)
+```
+
+Having established how quickly films capture revenue and where marginal gains end, the next question asks which release windows are most vulnerable when a blockbuster anchor is removed. Practically, if a week’s typical film is propped up by one or two big titles, smaller releases that week face much higher downside risk. To measure that risk I built a vulnerability metric that compares the median film gross for a window with and without the top K films. The median is used to represent the typical film and to reduce sensitivity to extreme outliers. I also ran a sensitivity test for K from 1-15 to confirm how the vulnerability metric responds to removing the top K films.
+
+- **Vulnerability** = fractional drop in the median film gross for a window when the top K films are removed. Values near 1 mean the median collapses without the anchor. Values near 0 mean little dependence.
+
+- **Robustness checks**: remove the top 12 extreme outliers and repeat the analysis, and run the test for weekly, 5 day, 3 day and weekend windows.
+
+- **Sensitivity**: choose K by scanning 1-15 and pick the elbow (kink) to balance signal and noise.
+
+```{python}
+df['week_start_date'] = pd.to_datetime(df['week_start_date'])
+df['actual_sales_date'] = pd.to_datetime(df['actual_sales_date'])
+start_date = df['actual_sales_date'].min().normalize()
+df['release_week'] = df['week_start_date'].dt.to_period('W').apply(lambda r: r.start_time)
+
+# 12 outliers
+outlier_by_lifetime = (df[['numero_film_id','lifetime_total']]
+                       .drop_duplicates(subset='numero_film_id')
+                       .sort_values('lifetime_total', ascending=False)
+                       .head(12))
+outlier_ids = outlier_by_lifetime['numero_film_id'].tolist()
+df['is_upper_outlier'] = df['numero_film_id'].isin(outlier_ids)
+#  exclude top 12
+df_clean = df[~df['is_upper_outlier']].copy()
+
+df_clean['actual_sales_date'] = pd.to_datetime(df_clean['actual_sales_date'])
+
+# anchor start_date to the earliest sales date
+start_date = df_clean['actual_sales_date'].min().normalize()
+
+# day index relative to start_date
+df_clean['day_index'] = (df_clean['actual_sales_date'] - start_date).dt.days
+
+# non-overlapping windows (start date of each window)
+df_clean['window_3d_start'] = (df_clean['day_index'] // 3).apply(lambda i: start_date + pd.Timedelta(days=3*i))
+df_clean['window_5d_start'] = (df_clean['day_index'] // 5).apply(lambda i: start_date + pd.Timedelta(days=5*i))
+
+# weekly window
+df_clean['release_week'] = df_clean['actual_sales_date'].dt.to_period('W').apply(lambda r: r.start_time)
+
+# weekend vs weekday (Fri-Sun as weekend)
+df_clean['weekday'] = df_clean['actual_sales_date'].dt.weekday  # Mon=0
+df_clean['is_weekend'] = df_clean['weekday'].isin([4,5,6])
+df_clean['week_start'] = df_clean['actual_sales_date'].dt.to_period('W').apply(lambda r: r.start_time)
+df_clean['window_weekend'] = df_clean['week_start'].astype(str) + '_' + df_clean['is_weekend'].map({True:'weekend', False:'weekday'})
+
+# build_film_week
+def build_film_week(df_clean, window_col='release_week'):
+    film_week = (df_clean.groupby([window_col, 'numero_film_id'], as_index=False)
+                 .agg(film_week_gross=('week_gross_at_cinema','sum'),
+                      film_opening_week_total=('opening_week_total','max'),
+                      opening_screen_average=('opening_screen_average','max'),
+                      title=('title','first'),
+                      distributor=('distributor','first')))
+    film_week = film_week.rename(columns={window_col: 'window_start'})
+    return film_week
+
+# film by time
+film_week_weekly = build_film_week(df_clean, window_col='release_week')
+film_week_3d = build_film_week(df_clean, window_col='window_3d_start')
+film_week_5d = build_film_week(df_clean, window_col='window_5d_start')
+film_week_weekend = build_film_week(df_clean, window_col='window_weekend')
+```
+
+```{python}
+def bootstrap_median_diff_unpaired(a, b, n_boot=2000, random_state=None):
+    a = np.asarray(a.dropna()) if hasattr(a, "dropna") else np.asarray(a)
+    b = np.asarray(b.dropna()) if hasattr(b, "dropna") else np.asarray(b)
+    if len(a) < 2 or len(b) < 2:
+        return (np.nan, np.nan)
+    rng = np.random.default_rng(random_state)
+    diffs = np.empty(n_boot, dtype=float)
+    for i in range(n_boot):
+        sa = rng.choice(a, size=len(a), replace=True)
+        sb = rng.choice(b, size=len(b), replace=True)
+        diffs[i] = np.median(sa) - np.median(sb)
+    return tuple(np.percentile(diffs, [2.5, 97.5]))
+
+def bootstrap_median_diff_paired(a, b, n_boot=2000, random_state=None):
+    a = np.asarray(a)
+    b = np.asarray(b)
+    if len(a) != len(b) or len(a) < 2:
+        return (np.nan, np.nan)
+    rng = np.random.default_rng(random_state)
+    idx = np.arange(len(a))
+    diffs = np.empty(n_boot, dtype=float)
+    for i in range(n_boot):
+        s = rng.choice(idx, size=len(idx), replace=True)
+        diffs[i] = np.median(a[s]) - np.median(b[s])
+    return tuple(np.percentile(diffs, [2.5, 97.5]))
+
+def safe_bootstrap_median_diff(a, b, n_boot=2000, paired=False, random_state=None):
+    if paired:
+        return bootstrap_median_diff_paired(a, b, n_boot=n_boot, random_state=random_state)
+    else:
+        return bootstrap_median_diff_unpaired(a, b, n_boot=n_boot, random_state=random_state)
+
+def compute_vulnerability_by_k(film_week, release_week_col='window_start',
+                               film_id_col='numero_film_id', gross_col='film_week_gross',
+                               K=5, drop_outliers_ids=None, bootstrap=False, n_boot=1000,
+                               random_state=None):
+    df = film_week.copy()
+    if drop_outliers_ids is not None:
+        df = df[~df[film_id_col].isin(drop_outliers_ids)].copy()
+
+    # aggregates per window (use gross_col)
+    base = (df.groupby(release_week_col, as_index=False)
+              .agg(total_gross=(gross_col,'sum'),
+                   median_gross=(gross_col,'median'),
+                   n_releases=(film_id_col,'nunique')))
+
+    # robust concentration metrics
+    def herfindahl(group):
+        total = group[gross_col].sum()
+        if total == 0:
+            return np.nan
+        s = group[gross_col] / total
+        return (s**2).sum()
+
+    def gini(group):
+        arr = np.sort(group[gross_col].values)
+        n = len(arr)
+        if n == 0 or arr.sum() == 0:
+            return np.nan
+        return (2*np.sum((np.arange(1,n+1) * arr)) / (n*arr.sum())) - (n+1)/n
+
+    conc = (df.groupby(release_week_col).apply(lambda g: pd.Series({
+                'herfindahl': herfindahl(g),
+                'gini': gini(g)
+            })).reset_index())
+
+    base = base.merge(conc, on=release_week_col, how='left')
+
+    # prepare groups and ordered ids once
+    df_sorted = df.sort_values([release_week_col, gross_col], ascending=[True, False])
+    groups = {wk: g for wk, g in df_sorted.groupby(release_week_col)}
+    ordered_ids_by_week = {}
+    for wk, g in groups.items():
+        ordered_ids_by_week[wk] = (
+            g[[film_id_col, gross_col]]
+            .drop_duplicates(subset=film_id_col)
+            .sort_values(gross_col, ascending=False)[film_id_col]
+            .tolist()
+        )
+
+    rows = []
+    for week_key, g in groups.items():
+        n = g[film_id_col].nunique()
+        total = g[gross_col].sum()
+        median = g[gross_col].median()
+
+        # skip tiny windows (or emit baseline row if you prefer)
+        if n < 2:
+            continue
+
+        ordered_ids = ordered_ids_by_week.get(week_key, [])
+        max_k = min(K, len(ordered_ids))
+        for k in range(0, max_k + 1):
+            if k == 0:
+                total_no = total
+                median_no = median
+                topk_share = 0.0
+                vuln_total = 0.0
+                vuln_median = 0.0
+            else:
+                remove_ids = set(ordered_ids[:k])
+                g_no = g[~g[film_id_col].isin(remove_ids)]
+                total_no = g_no[gross_col].sum()
+                median_no = g_no[gross_col].median() if len(g_no) > 0 else np.nan
+                topk_share = (g[g[film_id_col].isin(remove_ids)][gross_col].sum() / total) if total > 0 else np.nan
+                vuln_total = ((total - total_no) / total) if total > 0 else np.nan
+                vuln_median = ((median - median_no) / median) if (median > 0 and not np.isnan(median_no)) else np.nan
+
+            rows.append({
+                release_week_col: week_key,
+                'k': k,
+                'n_releases': n,
+                'total_gross': total,
+                'median_gross': median,
+                'total_gross_no_topk': total_no,
+                'median_gross_no_topk': median_no,
+                'topk_share': topk_share,
+                'vuln_total': vuln_total,
+                'vuln_median': vuln_median
+            })
+
+    out = pd.DataFrame(rows).merge(base, on=release_week_col, how='left')
+
+    # bootstrap for median drop per (week,k)
+    if bootstrap:
+        cis_low, cis_high = [], []
+        for _, r in out.iterrows():
+            week_key = r[release_week_col]
+            k = int(r['k'])
+            g = groups.get(week_key)
+            ordered_ids = ordered_ids_by_week.get(week_key, [])
+
+            if g is None:
+                cis_low.append(np.nan); cis_high.append(np.nan); continue
+            if k == 0:
+                cis_low.append(0.0); cis_high.append(0.0); continue
+
+            remove_ids = set(ordered_ids[:k])
+            a = g[gross_col]
+            b = g[~g[film_id_col].isin(remove_ids)][gross_col]
+            low, high = safe_bootstrap_median_diff(a, b, n_boot=n_boot, paired=False, random_state=random_state)
+            cis_low.append(low); cis_high.append(high)
+
+        out['median_drop_ci_low'] = cis_low
+        out['median_drop_ci_high'] = cis_high
+
+    return out
+
+# pick worst k per window
+def worst_k_per_window(res, window_col='window_start'):
+    most_vuln = res.loc[res.groupby(window_col)['vuln_median'].idxmax()].reset_index(drop=True)
+    most_vuln['robust'] = (most_vuln['median_drop_ci_low'].notna()) & \
+                         (most_vuln['median_drop_ci_low'] > 0) & \
+                         (most_vuln['n_releases_x'] >= 4)
+    return most_vuln
+```
+
+The number of top films removed can directly change the vulnerability measure. If K is too small the test can miss cases where a few anchor films prop up a week. If K is too large the test removes most of the slate and raises vulnerability by design. Choosing K therefore requires balancing the need to detect a single anchor against avoiding an artificial collapse caused by removing too many films.
+
+```{python}
+seed = 68 
+n_boot = 500
+Ks = range(1, 16)
+rows = []
+
+for K in Ks:
+    res = compute_vulnerability_by_k(film_week_weekly, K=K,
+                                    drop_outliers_ids=outlier_ids,
+                                    bootstrap=True, n_boot=200, random_state=seed)
+
+    if 'k' not in res.columns:
+        rows.append({'k': K, 'vuln_median': np.nan, 'topk_share': np.nan, 'n_releases_x': np.nan})
+        continue
+
+    # take median across windows for this K
+    s = res[res['k'] == K]
+    if s.empty:
+        rows.append({'k': K, 'vuln_median': np.nan, 'topk_share': np.nan, 'n_releases_x': np.nan})
+    else:
+        rows.append({
+            'k': K,
+            'vuln_median': s['vuln_median'].median(),
+            'topk_share': s['topk_share'].median(),
+            'n_releases_x': s['n_releases_x'].median()
+        })
+```
+
+::::: {layout = "[80,20]"}
+::: {#firstcolumn}
+
+```{python}
+sweep_df = pd.DataFrame(rows).set_index('k')
+sweep_df.plot(y='vuln_median', marker='o', figsize=(8,4), legend=False)
+plt.xlabel('k (top k removed)')
+plt.ylabel('Median vulnerability')
+plt.title('Vulnerability vs k')
+plt.show()
+```
+
+:::
+::: {#secondcolumn}
+
+A sensitivity check run with K from 1-15 shows median vulnerability rising until K=5 and then leveling off, which supports using K=5 as a practical monitoring standard. Increasing K further adds little signal and mainly increases noise.
+
+:::
+:::::
+
+```{python}
+res_weekly = compute_vulnerability_by_k(film_week_weekly, K=5, drop_outliers_ids=outlier_ids, bootstrap=True, n_boot=n_boot, random_state=seed)
+res_3d = compute_vulnerability_by_k(film_week_3d, K=5, drop_outliers_ids=outlier_ids, bootstrap=True, n_boot=n_boot, random_state=seed)
+res_5d = compute_vulnerability_by_k(film_week_5d, K=5, drop_outliers_ids=outlier_ids, bootstrap=True, n_boot=n_boot, random_state=seed)
+res_weekend = compute_vulnerability_by_k(film_week_weekend, K=5, drop_outliers_ids=outlier_ids, bootstrap=True, n_boot=n_boot, random_state=seed)
+```
+
+```{python}
+most_vuln_weekly  = worst_k_per_window(res_weekly,  window_col='window_start')
+most_vuln_3d      = worst_k_per_window(res_3d,      window_col='window_start')
+most_vuln_5d      = worst_k_per_window(res_5d,      window_col='window_start')
+most_vuln_weekend = worst_k_per_window(res_weekend, window_col='window_start')
+most_vuln_weekend = most_vuln_weekend[most_vuln_weekend['window_start'].str.endswith('_weekend')]
+```
+
+K=5 is used for the plots that follow. I also reran the test excluding the top 12 outliers and evaluated weekly, five day, three day and weekend windows to check robustness and discover where risk is concentrated in time.
+
+```{python}
+# Vulnerability timeline plots
+def plot_vulnerability(
+    df_in: pd.DataFrame,
+    K: int = 5,
+    week_col: str = 'window_start',
+    vuln_col: str = 'vuln_median',
+    count_col: str = 'n_releases_y',
+    topN: int = 5,
+    tick_step: int = 1,
+    title: str = 'Vulnerability timeline',
+    show_k_line: bool = True,
+    show_legend: bool = True,
+    force_weekly: Optional[bool] = None,
+    window_unit: Optional[int] = None, 
+    id_col: Optional[str] = None        
+) -> go.Figure:
+
+    df = df_in.copy()
+    if week_col not in df.columns:
+        raise ValueError(f"week_col '{week_col}' not found in dataframe")
+    if vuln_col not in df.columns:
+        raise ValueError(f"vuln_col '{vuln_col}' not found in dataframe")
+
+    # Cleaning
+    parsed = pd.to_datetime(df[week_col], errors='coerce')
+    df['_window_dt'] = parsed
+
+    # If many NaT, parse a leading YYYY-MM-DD prefix from strings
+    if df['_window_dt'].isna().sum() > 0:
+        def parse_prefix(s):
+            try:
+                return pd.to_datetime(str(s).split('_')[0], errors='coerce')
+            except Exception:
+                return pd.NaT
+        parsed_prefix = df[week_col].apply(parse_prefix)
+        df['_window_dt'] = df['_window_dt'].fillna(parsed_prefix)
+
+    # Windows setting
+    if force_weekly is True:
+        use_weekly = True
+    elif force_weekly is False:
+        use_weekly = False
+    else:
+        # If most rows parse to datetime and median spacing 7 days -> weekly
+        n_parsed = df['_window_dt'].notna().sum()
+        if n_parsed >= max(1, len(df) // 2):
+            diffs = df.loc[df['_window_dt'].notna(), '_window_dt'].sort_values().diff().dt.days.dropna()
+            median_diff = int(diffs.median()) if not diffs.empty else 7
+            use_weekly = abs(median_diff - 7) <= 1
+        else:
+            use_weekly = False
+
+    if isinstance(window_unit, int) and window_unit > 0:
+        use_weekly = (window_unit == 7)
+
+    # Positions
+    if use_weekly:
+        # compute week_idx using 7-day bins anchored to min datetime
+        min_start = df['_window_dt'].min()
+        if pd.isna(min_start):
+            df = df.sort_values(week_col).reset_index(drop=True)
+            df['x_idx'] = np.arange(1, len(df) + 1)
+        else:
+            df = df.sort_values('_window_dt').reset_index(drop=True)
+            df['x_idx'] = ((df['_window_dt'] - min_start).dt.days // 7).astype(int) + 1
+        df['hover_label'] = df['x_idx'].astype(int).astype(str)
+        hover_label_title = 'Week'
+        topN_selector_col = 'x_idx'
+    else:
+        # Non-weekly
+        if df['_window_dt'].notna().any():
+            df = df.sort_values(['_window_dt', week_col], na_position='last').reset_index(drop=True)
+        else:
+            df = df.sort_values(week_col).reset_index(drop=True)
+        df['x_idx'] = np.arange(1, len(df) + 1)
+        if id_col and id_col in df.columns:
+            df['hover_label'] = df[id_col].astype(str)
+            topN_selector_col = id_col
+            hover_label_title = id_col
+        else:
+            # fallback to sequential id
+            df['hover_label'] = df['x_idx'].astype(int).astype(str)
+            topN_selector_col = 'x_idx'
+            hover_label_title = 'Window id'
+
+    # Hover fields
+    df['week_start_str'] = df[week_col].astype(str)
+    df['films_available'] = pd.to_numeric(df.get(count_col, 0)).fillna(0).astype(float)
+
+    # Month ticks
+    if df['_window_dt'].notna().any():
+        df['_month'] = df['_window_dt'].dt.to_period('M')
+        month_first = (
+            df.groupby('_month', as_index=False)
+              .agg(first_x=('x_idx', 'min'),
+                   month_start_date=('_window_dt', 'min'))
+              .sort_values('first_x')
+        )
+        xticks = month_first['first_x'].tolist()
+        xlabels = month_first['month_start_date'].dt.strftime('%b').tolist()
+    else:
+        x_min, x_max = int(df['x_idx'].min()), int(df['x_idx'].max())
+        n_ticks = max(4, min(12, (x_max - x_min) // 4 + 1))
+        xticks = list(np.linspace(x_min, x_max, n_ticks, dtype=int))
+        xlabels = [str(t) for t in xticks]
+
+    # Top N
+    topN_df = df.sort_values(vuln_col, ascending=False).head(topN)
+
+    # Hover template
+    hover_template = (
+        f"<b>{hover_label_title}: %{{customdata[3]}}</b><br>"
+        "Window start: %{customdata[0]}<br>"
+        "Vulnerability (median): %{y:.3f}<br>"
+        "Worst-k: %{customdata[1]}<br>"
+        "Films available: %{customdata[2]}<extra></extra>"
+    )
+
+    # Subplot
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+
+    # Secondary y - films available (right)
+    fig.add_trace(
+        go.Bar(x=df['x_idx'], y=df['films_available'],
+            marker=dict(color='lightgray'), opacity=0.5,
+            name='Films available',
+            hovertemplate="Index: %{x}<br>Films available: %{y}<extra></extra>",
+            showlegend=show_legend
+        ),
+        secondary_y=True
+    )
+
+    # Primary y - Vulnerability (left)
+    k_col = df['k'] if 'k' in df.columns else pd.Series([np.nan]*len(df))
+    fig.add_trace(
+        go.Scatter(x=df['x_idx'], y=df[vuln_col], mode='lines+markers',
+            line=dict(color='steelblue', width=1.5),
+            marker=dict(size=7, color='cornflowerblue', line=dict(width=0.5, color='white')),
+            name='Vulnerability (median)',
+            customdata=np.stack([df['week_start_str'], k_col.fillna(np.nan), df['films_available'], df['hover_label']], axis=-1),
+            hovertemplate=hover_template,
+            showlegend=show_legend
+        ),
+        secondary_y=False
+    )
+
+    # Top N highlights
+    fig.add_trace(
+        go.Scatter(x=topN_df['x_idx'], y=topN_df[vuln_col], mode='markers',
+            marker=dict(size=14, color='rgba(0,0,0,0)', line=dict(color='red', width=2)),
+            name=f'Top {topN}',
+            customdata=np.stack([topN_df['week_start_str'],
+                                 topN_df.get('k', pd.Series([np.nan]*len(topN_df))).fillna(np.nan),
+                                 topN_df['films_available'],
+                                 topN_df['hover_label']], axis=-1),
+            hovertemplate=hover_template,
+            showlegend=show_legend
+        ),
+        secondary_y=False
+    )
+
+    # Annotations for topN
+    for _, r in topN_df.iterrows():
+        label = str(r['hover_label'])
+        fig.add_annotation(x=r['x_idx'] + 0.3, y=r[vuln_col], text=label,
+            showarrow=False, font=dict(color='red', size=10), xanchor='left', yanchor='bottom')
+
+    # Right axis ticks independent from left axis
+    max_count = int(df['films_available'].max()) if not df['films_available'].isna().all() else 1
+    max_tick = max(3, ((max_count + tick_step - 1) // tick_step) * tick_step)
+    tick_vals = list(range(0, max_tick + 1, tick_step))
+
+    # Axes
+    fig.update_xaxes(tickmode='array', tickvals=xticks, ticktext=xlabels,
+                     title_text='Month', range=[0, int(df['x_idx'].max()) + 2])
+    fig.update_yaxes(title_text='Vulnerability (median drop)', range=[0, 1.05],
+                     secondary_y=False, showgrid=False)
+    fig.update_yaxes(title_text='Films available', range=[0, max_tick],
+                     tickmode='array', tickvals=tick_vals, secondary_y=True, showgrid=False)
+
+    # K line
+    if show_k_line:
+        fig.add_shape(type="line", x0=0, x1=int(df['x_idx'].max()) + 2, xref='x',
+                      y0=K, y1=K, yref='y2', line=dict(color='red', width=1.5, dash='dash'), layer='above')
+        fig.add_annotation(x=0.93, xref='paper', y=K-0.3, yref='y2', text=f'k = {K}',
+                           showarrow=False, xanchor='right', yanchor='middle',
+                           font=dict(color='red'), bgcolor='rgba(255,255,255,0.7)')
+
+    # Vertical boundaries
+    for idx in xticks:
+        fig.add_vline(x=idx, line=dict(color='gray', width=0.5, dash='dash'), layer='below')
+
+    # Layout
+    fig.update_layout(title=title, template='plotly_white', 
+                      legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
+                      hovermode='closest')
+    fig.update_xaxes(showgrid=False)
+    fig.update_yaxes(showgrid=False, secondary_y=False)
+    fig.update_yaxes(showgrid=False, secondary_y=True)
+
+    return fig
+```
+
+## Main test (K=5)
+
+```{python}
+# Weekly
+fig = plot_vulnerability(most_vuln_weekly, K=5, title='Weekly Vulnerability')
+fig.show()
+```
+
+A numnber of weeks stand out with the highest median vulnerability. The top weeks cluster in mid year with several peaks around April, a few in May, June and July, and September. Although The number of films available varies week to week, high vulnerability weeks are not simply the weeks with the fewest films.
+
+```{python}
+# 3-day windows
+fig3 = plot_vulnerability(most_vuln_3d, K=5, window_unit=3, id_col='window_id', title='3-day windows Vulnerability', topN=10)
+fig3.show()
+```
+
+The three day view highlights the same calendar periods as the weekly view rather than revealing new isolated spikes. The highest vulnerability points line up with the same calendar periods flagged in the weekly analysis, but they appear more spread across neighboring short windows, with April showing the broadest cluster. September still shows elevated risk but with lower intensity in the three day view.
+
+```{python}
+# 5-day windows
+fig5 = plot_vulnerability(most_vuln_5d, K=5, window_unit=5, title='5-day windows Vulnerability', topN=10)
+fig5.show()
+```
+
+The five day view confirms the weekly peaks while removing short term noise and revealing crowding that a three day view can miss. April shows broad crowding across several days, and the September signal that is weak in the three day view appears clearly in the five day view.
+
+-> The vulnerability is not just a weekend effect here. Some risks span multiple days and are best detected with a slightly wider window in this case.
+
+```{python}
+# Weekend windows
+fig_weekend = plot_vulnerability(most_vuln_weekend, K=5, title='Weekend Vulnerability')
+fig_weekend.show()
+```
+
+The weekend view amplifies the same calendar hotspots and makes April and May stand out. The metric also shows the risk is concentrated on those holiday weekends rather than in June, July or September.
+
+Through the analysis the most vulnerable release windows emerge in April and May, with additional mid year weeks and some risk in September. These windows show the largest median drops when the top five films are removed, which means the typical film in those windows depends heavily on one or two anchors. 
+
+- The weekly, five day, three day and weekend views all point to the same calendar periods, so the signal is not an artifact of aggregation. 
+
+- Short windows show April as a broad cluster across adjacent days. The five day view confirms that crowding spans multiple days and also reveals a September signal that the three day view mutes. The five day window strikes the best balance between sensitivity to short term spikes and stability for decision making.
+
+- The weekend view highlights April and May in particular, consistent with holiday driven audience shifts. 
+
+- Local calendars help explain this pattern: 
+    - In Australia the school winter break falls in June and July, and Mother’s Day and Anzac Day in April and May shift when families go to the cinema. 
+    - In India the school summer break and variable festival dates often fall in May and June, and major cricket and film release cycles concentrate audience attention in the same weeks. 
+    When big films open around these dates they can pull most of the box office and leave smaller titles exposed. Risk can come from holiday driven family demand, festival timing, or major sports and film events that change viewing patterns. A week that looks safe by film count can still be fragile if one or two anchors dominate.
+
+**Reccomendation:** 
+
+- Do not schedule many marginal openings on April and May holiday weekends in Australia and India. Prefer nearby non holiday weekends for smaller titles.
+
+- If a week shows high five day vulnerability, treat the risk as multi day and take broader action such as move release dates, spread marketing across several days, or limit the number of small openings that week.
+
+- Require a confirmed anchor before approving multiple small openings in a flagged window and log the numeric checks and rationale for every decision.
+
+## Sensitivity check (K=3)
+
+I reran the vulnerability test with K=3 as a sensitivity check and the results are consistent with the K=5 analysis.
+
+```{python}
+res_weekly_3 = compute_vulnerability_by_k(film_week_weekly, K=3, drop_outliers_ids=outlier_ids, bootstrap=True, n_boot=n_boot, random_state=seed)
+res_3d_3 = compute_vulnerability_by_k(film_week_3d, K=3, drop_outliers_ids=outlier_ids, bootstrap=True, n_boot=n_boot, random_state=seed)
+res_5d_3 = compute_vulnerability_by_k(film_week_5d, K=3, drop_outliers_ids=outlier_ids, bootstrap=True, n_boot=n_boot, random_state=seed)
+res_weekend_3 = compute_vulnerability_by_k(film_week_weekend, K=3, drop_outliers_ids=outlier_ids, bootstrap=True, n_boot=n_boot, random_state=seed)
+```
+
+```{python}
+most_vuln_weekly_3  = worst_k_per_window(res_weekly_3,  window_col='window_start')
+most_vuln_3d_3      = worst_k_per_window(res_3d_3,      window_col='window_start')
+most_vuln_5d_3    = worst_k_per_window(res_5d_3,      window_col='window_start')
+most_vuln_weekend_3 = worst_k_per_window(res_weekend_3, window_col='window_start')
+most_vuln_weekend_3 = most_vuln_weekend[most_vuln_weekend_3['window_start'].str.endswith('_weekend')]
+```
+
+```{python}
+# Weekly
+fig_weekly_3 = plot_vulnerability(most_vuln_weekly_3, K=3, title='Weekly Vulnerability')
+fig_weekly_3.show()
+```
+
+```{python}
+# 3-day windows
+fig3_3 = plot_vulnerability(most_vuln_3d_3, K=3, window_unit=3, id_col='window_id', title='3-day windows Vulnerability', topN=10)
+fig3_3.show()
+```
+
+```{python}
+# 5-day windows
+fig5_3 = plot_vulnerability(most_vuln_5d_3, K=3, window_unit=5, title='5-day windows Vulnerability', topN=10)
+fig5_3.show()
+```
+
+```{python}
+# Weekend windows
+fig_weekend_3 = plot_vulnerability(most_vuln_weekend_3, K=3, title='Weekend Vulnerability')
+fig_weekend_3.show()
+```
+
+The same calendar windows rank as most vulnerable and the relative ordering of peaks does not change, though the absolute vulnerability values are slightly lower with K=3. That pattern shows the effect is driven by a single anchor or a very small group of anchors and is not an artifact of removing a large share of the slate. The finding also holds after excluding extreme outliers and across weekly, five day, three day and weekend views.
+

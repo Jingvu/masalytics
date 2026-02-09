@@ -1,0 +1,825 @@
+---
+title: The Time Factor in Film Performance
+format:
+  html:
+    page-layout: full
+    embed-resources: true
+    toc: true
+    grid:
+      body-width: 1200px
+jupyter: python3
+echo: false
+warning: false
+---
+
+
+```{python}
+#| output: false
+import importlib
+import pre_processing as prep
+import sqlite3
+import json
+import datetime
+from tqdm import tqdm
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import matplotlib.ticker as ticker
+import matplotlib.dates as mdates
+import plotly.express as px
+from plotly.subplots import make_subplots
+import plotly.graph_objects as go
+from lifelines import KaplanMeierFitter
+from typing import Optional
+
+conn = prep.connect_db("numero_data.sqlite")
+
+# Load raw json
+df_raw = prep.load_raw_sales(conn)
+df_sales = prep.flatten_sales_json(df_raw)
+prep.save_df_to_csv(df_sales, "sales_processed.csv")
+
+# Dataset
+df_meta, df_titles = prep.load_metadata_and_titles(conn) 
+df = prep.join_sales_metadata(df_sales, df_meta, df_titles)
+df_run, longest, segments, tmp, film_dates = prep.extract_longest_continuous_run(df, gap_days=7)
+```
+
+```{python}
+#| output: false
+print(df.shape)
+df.dtypes
+```
+
+Time is the clearest signal in the box office. Treating time as the lens turns sales into a decision engine that tells us when money arrives, how fast momentum builds or fades, and how long a title needs to prove itself. From that idea 3 questions emerged to turn timing into action. First we measure speed. Next we convert speed into a rule for how long to wait. Finally we test which calendar slots break when the big titles are removed. Each step is expected to narrow the decision space and points to a single time based action that can use.
+
+# QUESTION 1: How quickly do films generate the majority of their revenue?
+
+This question will be answered by treating the dataset as 2 separate groups and by measuring how quickly films reach two revenue milestones. First I split the sample into a mid market group that excludes the top 12 hits and a top group made up of those 12 films. For each group I compute days to reach 50% and days to reach 80% of scaled lifetime gross and then summarize those milestones with ECDFs and boxplots by state. I also plot days to milestone against opening screen average to see which films are front loaded and which build slowly.
+
+```{python}
+# Excluding top 12
+top_12_ids = df_run.groupby('numero_film_id')['gross_today'].sum().sort_values(ascending=False).head(12).index.tolist()
+sales_mid_market = df_run[~df_run['numero_film_id'].isin(top_12_ids)]
+
+# Only top 12
+df_top12 = df_run[df_run['numero_film_id'].isin(top_12_ids)].copy()
+```
+
+```{python}
+def film_velocity(df, df_full=None, scale_using_full=True):
+    """
+    Compute daily aggregates, scaled lifetime milestones, weekly series and film level summary.
+    """
+    # ensure dates
+    df = df.copy()
+    df['actual_sales_date'] = pd.to_datetime(df['actual_sales_date'])
+
+    # daily aggregation per film
+    film_daily = (
+        df
+        .groupby(['numero_film_id', 'actual_sales_date'], as_index=False)
+        .agg(
+            gross_today=('gross_today', 'sum'),
+            lifetime_total=('lifetime_total', 'first'),
+            title=('title_label', 'first'),
+            state=('state', 'first')
+        )
+        .sort_values(['numero_film_id', 'actual_sales_date'])
+    )
+
+    # cumulative gross within each film run
+    film_daily['cum_gross'] = film_daily.groupby('numero_film_id')['gross_today'].cumsum()
+
+    # scaling factor
+    if scale_using_full and (df_full is not None):
+        observed = df_full.groupby('numero_film_id', as_index=False)['gross_today'].sum().rename(columns={'gross_today':'observed_sum'})
+        lifetime_first = df_full.groupby('numero_film_id', as_index=False)['lifetime_total'].first().rename(columns={'lifetime_total':'lifetime_total_first'})
+    else:
+        observed = film_daily.groupby('numero_film_id', as_index=False)['gross_today'].sum().rename(columns={'gross_today':'observed_sum'})
+        lifetime_first = film_daily.groupby('numero_film_id', as_index=False)['lifetime_total'].first().rename(columns={'lifetime_total':'lifetime_total_first'})
+
+    # compute per-film ratio and median scaling
+    ratio = (observed['observed_sum'] / lifetime_first['lifetime_total_first']).replace([np.inf, -np.inf], np.nan)
+    scaling = ratio.dropna().median() if not ratio.dropna().empty else 1.0
+
+    # apply scaling to lifetime_total in film_daily
+    film_daily['lifetime_total_scaled'] = film_daily['lifetime_total'] * scaling
+
+    # compute milestone days (50% and 80%) per film
+    def _milestones(group):
+        start = group['actual_sales_date'].min()
+        L = group['lifetime_total_scaled'].iloc[0]
+        if pd.isna(L) or L <= 0:
+            return pd.Series({'days_to_50pct': np.nan, 'days_to_80pct': np.nan})
+        day50 = group.loc[group['cum_gross'] >= 0.5 * L, 'actual_sales_date'].min()
+        day80 = group.loc[group['cum_gross'] >= 0.8 * L, 'actual_sales_date'].min()
+        return pd.Series({
+            'days_to_50pct': (day50 - start).days if pd.notnull(day50) else np.nan,
+            'days_to_80pct': (day80 - start).days if pd.notnull(day80) else np.nan
+        })
+
+    film_velocity = film_daily.groupby('numero_film_id').apply(_milestones).reset_index()
+
+    # weekly aggregation relative to run start
+    first_dates = film_daily.groupby('numero_film_id', as_index=False)['actual_sales_date'].min().rename(columns={'actual_sales_date':'first_date'})
+    film_daily = film_daily.merge(first_dates, on='numero_film_id', how='left')
+    film_daily['day'] = (film_daily['actual_sales_date'] - film_daily['first_date']).dt.days + 1
+    film_daily['week'] = ((film_daily['day'] - 1) // 7) + 1
+
+    weekly = (
+        film_daily
+        .groupby(['numero_film_id', 'week'], as_index=False)
+        .agg(
+            week_gross=('gross_today', 'sum'),
+            title=('title', 'first'),
+            state=('state', 'first')
+        )
+        .sort_values(['numero_film_id', 'week'])
+    )
+    weekly['cum_gross'] = weekly.groupby('numero_film_id')['week_gross'].cumsum()
+
+    # film_dates for survival
+    film_dates = (
+        df.groupby('numero_film_id', as_index=False)
+                 .agg(first_date=('actual_sales_date','min'),
+                      last_date=('actual_sales_date','max'))
+    )
+    if 'run_days_longest' in df.columns:
+        film_dates = film_dates.merge(df[['numero_film_id','run_days_longest']].drop_duplicates('numero_film_id'),
+                                      on='numero_film_id', how='left')
+    else:
+        film_dates['run_days_longest'] = (film_dates['last_date'] - film_dates['first_date']).dt.days + 1
+
+    dataset_end = df['actual_sales_date'].max()
+    film_dates['duration_weeks'] = film_dates['run_days_longest'] / 7
+    film_dates['event_observed'] = (film_dates['last_date'] < dataset_end).astype(int)
+
+    # film-level covariates
+    source_for_meta = df_full if df_full is not None else df
+    film_meta = (
+        source_for_meta.groupby('numero_film_id', as_index=False)
+                       .agg(
+                           opening_screen_average=('opening_screen_average', 'first'),
+                           lifetime_total=('lifetime_total', 'first'),
+                           title=('title', 'first'),
+                           state=('state', 'first')
+                       )
+    )
+
+    # normalize state and map to short codes
+    film_meta['state_norm'] = film_meta['state'].astype(str).str.strip().str.lower()
+    state_map = {
+        'new south wales (inc act)': 'NSW',
+        'queensland': 'QLD',
+        'victoria (inc tas)': 'VIC',
+        'south australia': 'SA',
+        'western australia': 'WA',
+        'northern territory': 'NT'
+    }
+    film_meta['state_group'] = film_meta['state_norm'].map(state_map).fillna(film_meta['state_norm'])
+
+    # attach one scaled lifetime per film (from film_daily)
+    scaled_lt = film_daily.groupby('numero_film_id', as_index=False)['lifetime_total_scaled'].first()
+    film_meta = film_meta.merge(scaled_lt, on='numero_film_id', how='left')
+
+    # final merged summary
+    summary_state = film_velocity.merge(film_meta, on='numero_film_id', how='left')
+
+    # return results and the scaling factor for transparency
+    return {
+        'film_daily': film_daily,
+        'film_velocity': film_velocity,
+        'weekly': weekly,
+        'film_dates': film_dates,
+        'film_meta': film_meta,
+        'summary_state': summary_state,
+        'scaling': scaling
+    }
+```
+
+```{python}
+# Excluding top 12
+res_mid = film_velocity(sales_mid_market, df_run, scale_using_full=True)
+summary_mid = res_mid['summary_state'].copy()
+
+# Only top 12
+res_top = film_velocity(df_top12, df_run, scale_using_full=True)
+summary_top = res_top['summary_state'].copy()
+```
+
+## Days to reach 50%
+
+This plot shows the empirical cumulative distribution of days to reach 50 % of scaled lifetime gross for mid market films. Each line is a state and the vertical axis shows the proportion of films that have hit the 50 percent milestone by each day since first sale. 
+
+::::: {layout = "[20,80]"}
+::: {#firstcolumn}
+
+```{python}
+# drop missing values and prepare plotting frame
+plot_df = summary_mid.dropna(subset=["days_to_50pct"]).copy()
+
+# compute state order by sample size (largest first)
+state_counts = plot_df.groupby("state_group")["numero_film_id"].nunique().sort_values(ascending=False)
+state_order = state_counts.index.tolist()
+
+# Plot
+fig = go.Figure()
+
+for state in state_order:
+    grp = plot_df[plot_df["state_group"] == state]
+    x = np.sort(grp["days_to_50pct"].values)
+    n = len(x)
+    if n == 0:
+        continue
+    y = np.arange(1, n + 1) / n
+
+    fig.add_trace(
+        go.Scatter(x=x, y=y, mode="lines",
+            line=dict(width=2),
+            name=f"{state} (n={n})",
+            line_shape="hv", # hv: horizontal then vertical
+            hovertemplate=(
+                "<b>%{text}</b><br>"
+                "Days to 50%: %{x}<br>"
+                "Proportion: %{y:.2f}<extra></extra>"
+            ),
+            text=[state] * n
+        )
+    )
+
+fig.update_xaxes(range=[0, 10], dtick=1, title_text="Days to reach 50%")
+fig.update_yaxes(range=[0, 1], title_text="Proportion of films", tickformat=".0%")
+fig.update_layout(
+    title="Mid market: ECDF of Days to 50% by State (Excluding Top 12 Hits)",
+    template="plotly_white",
+    width=900,
+    height=520,
+    legend=dict(title="State (n)", orientation="v", x=1.02, y=1),
+    margin=dict(l=60, r=260, t=70, b=60),
+    hoverlabel=dict(bgcolor="white", font_size=12)
+)
+
+fig.show()
+```
+
+:::
+::: {#secondcolumn}
+The lines for New South Wales and Victoria climb steeply in the first few days. Half of the films in those states reach 50% by day three, which means revenue is strongly front loaded and most of the money is earned during the opening weekend and the immediate weekdays. Western Australia also rises early but has fewer films in the sample. South Australia and Queensland are noisy because they contain very few titles.
+:::
+:::::
+
+::::: {layout = "[20,80]"}
+::: {#firstcolumn}
+
+```{python}
+# drop missing values and prepare plotting frame
+plot_df_top12 = summary_top.dropna(subset=['days_to_50pct']).copy()
+
+# Plot
+fig = go.Figure()
+
+for state in state_order:
+    grp = plot_df_top12[plot_df_top12["state_group"] == state]
+    x = np.sort(grp["days_to_50pct"].values)
+    n = len(x)
+    if n == 0:
+        continue
+    y = np.arange(1, n + 1) / n
+
+    fig.add_trace(
+        go.Scatter(x=x, y=y, mode="lines", line=dict(width=2),
+            name=f"{state} (n={n})",
+            line_shape="hv",
+            hovertemplate=(
+                "<b>%{text}</b><br>"
+                "Days to 50%: %{x}<br>"
+                "Proportion: %{y:.2f}<extra></extra>"
+            ),
+            text=[state] * n
+        )
+    )
+
+fig.update_xaxes(range=[0, 10], dtick=1, title_text="Days to reach 50%")
+fig.update_yaxes(range=[0, 1], title_text="Proportion of films", tickformat=".0%")
+fig.update_layout(
+    title="Top market: ECDF of Days to 50% by State (Top 12 Hits)",
+    template="plotly_white",
+    width=900,
+    height=520,
+    legend=dict(title="State (n)", orientation="v", x=1.02, y=1),
+    margin=dict(l=60, r=260, t=70, b=60),
+    hoverlabel=dict(bgcolor="white", font_size=12)
+)
+
+fig.show()
+```
+
+:::
+::: {#secondcolumn}
+Top titles show greater variability. In New South Wales the median time to reach 50% is about four days, while Victoria displays a much wider spread. Big hits can still be front loaded, but they are more likely to have longer tails or varied patterns. Small sample sizes outside New South Wales make state level comparisons less reliable.
+
+:::
+:::::
+
+The boxplot below complements that by helping us summarize the same data so we can see how consistent that timing is within each state
+
+::::: {layout = "[20,80]"}
+::: {#firstcolumn}
+
+
+
+```{python}
+# State order
+state_order = ["NSW", "VIC", "WA", "SA", "QLD"]
+
+# Plot
+fig = px.box(plot_df, x="days_to_50pct", y="state_group",
+    category_orders={"state_group": state_order},
+    labels={"days_to_50pct": "Days to reach 50%", "state_group": "State"},
+    title="Mid market: Distribution of Days to 50% by State (Excluding Top 12 Hits)",
+    color_discrete_sequence=["cornflowerblue"],
+    points="outliers"
+)
+
+fig.update_xaxes(range=[0, 10], dtick=1)
+fig.update_yaxes(autorange="reversed")
+
+fig.update_layout(
+    template="plotly_white",
+    width=900,
+    height=420,
+    margin=dict(l=140, r=40, t=70, b=60),
+    yaxis=dict(title="State", categoryorder="array", categoryarray=state_order)
+)
+
+fig.show()
+```
+
+:::
+::: {#secondcolumn}
+
+In the mid market, New South Wales and Western Australia show short medians and tight boxes, so most films there reach 50% quickly and consistently. Victoria has a wider box, which indicates more variation in how fast films hit that milestone. In practice, we can be more confident running short windows in New South Wales and Western Australia, while in Victoria it makes sense to allow a little more time for titles that need to build.
+
+:::
+:::::
+
+::::: {layout = "[20,80]"}
+::: {#firstcolumn}
+ 
+
+```{python}
+fig = px.box(plot_df_top12, x="days_to_50pct", y="state_group",
+    category_orders={"state_group": state_order},
+    labels={"days_to_50pct": "Days to reach 50%", "state_group": "State"},
+    title="Top market: Distribution of Days to 50% by State (Top 12 Hits)",
+    color_discrete_sequence=["cornflowerblue"],
+    points="outliers"
+)
+
+fig.update_xaxes(range=[0, 11], dtick=1, title_text="Days to reach 50%")
+fig.update_yaxes(autorange="reversed")
+
+fig.update_layout(
+    template="plotly_white",
+    width=900,
+    height=420,
+    margin=dict(l=140, r=40, t=70, b=60),
+    yaxis=dict(title="State", categoryorder="array", categoryarray=state_order)
+)
+
+fig.show()
+```
+
+:::
+::: {#secondcolumn}
+In the top market, New South Wales and Victoria show some spread but the counts are small and the other states often show single points.
+
+:::
+:::::
+
+
+For the next step, scatter plots were used to add the next layer by showing how opening strength relates to speed of revenue capture for each film. This helps spot slow burners and strong openers at a glance. Use both to decide whether to apply a standard run length or treat titles case by case.
+
+The plot below shows a scatter of days to reach 50% against opening screen average for mid market films. Each point is a film and points are colored by state. 
+
+::::: {layout = "[20,80]"}
+::: {#firstcolumn}
+
+```{python}
+# Prepare data
+summary_mid.columns = summary_mid.columns.str.strip()
+
+# Columns check
+required = ['numero_film_id','days_to_50pct','opening_screen_average','lifetime_total_scaled','state_group','title']
+missing = [c for c in required if c not in summary_mid.columns]
+if missing:
+    raise KeyError(f"Missing required columns in summary_mid: {missing}")
+
+plot_df = summary_mid.dropna(subset=['days_to_50pct','opening_screen_average','lifetime_total_scaled']).copy()
+plot_df = plot_df.reset_index(drop=True)
+
+# Plotting columns
+plot_df['days_to_50pct'] = plot_df['days_to_50pct'].clip(lower=0)
+plot_df['days_plot'] = plot_df['days_to_50pct']
+plot_df['days_jitter'] = plot_df['days_plot'] + np.random.normal(0, 0.15, size=len(plot_df))
+
+# Scatter plot
+fig = px.scatter(plot_df, x='days_jitter', y='opening_screen_average', color='state_group', opacity=0.6,
+    hover_name='title',
+    custom_data=['days_to_50pct', 'lifetime_total_scaled', 'numero_film_id'],
+    labels={'days_jitter':'Days to 50%','opening_screen_average':'Opening screen average', 'state_group': 'State'},
+    title='Mid market: Days to 50% vs Opening')
+
+fig.update_traces(
+    marker=dict(size=8),
+    hovertemplate=(
+        "<b>%{hovertext}</b><br>" +
+        "Days to 50%: %{customdata[0]:.0f}<br>" +
+        "Opening avg: %{y:,.0f}<br>" +
+        "Lifetime gross: %{customdata[1]:,}<br>" +
+        "Film ID: %{customdata[2]}<extra></extra>"
+    ))
+
+fig.update_xaxes(range=[0,10], dtick=1)
+fig.add_vline(x=7, line=dict(color='red', dash='dash'), annotation_text='first week', annotation_position='top left')
+fig.update_layout(
+    template="plotly_white",
+    width=900,
+    height=420,
+    margin=dict(l=70, r=40, t=70, b=60)
+)
+fig.show()
+```
+
+:::
+::: {#secondcolumn}
+
+-> Most films cluster between day 1 and day 3, which matches the ECDF and shows that the bulk of revenue is captured very early. These films also span a wide range of opening screen averages, so a high opening average does not reliably predict a faster time to 50%.
+
+-> A small group of slow burners reach 50% much later despite low opening averages, suggesting word of mouth or niche appeal, 
+
+-> There is a single outlier with a high opening average that only hits 50% around day 9, which could reflect phased release patterns, reporting quirks, or a late second wave of demand. 
+
+:::
+:::::
+
+The takeaway is using opening screen average alone is not enough, it must be combined with week one share, week to week retention, and local demand before deciding whether to extend or cut screens.
+
+A clear split also appears in the data. Many films reach 50% within the first 4 days, while a smaller group does not get there until around day 9, with only some fall in the middle. This pattern supports using a standard programming window for most titles, while keeping targeted holds for the slow burners that show improving per screen performance.
+
+
+::::: {layout = "[20,80]"}
+::: {#firstcolumn}
+
+
+
+```{python}
+# Prepare data
+summary_top.columns = summary_top.columns.str.strip()
+
+# Columns check
+required = ['numero_film_id','days_to_50pct','opening_screen_average','lifetime_total_scaled','state_group','title']
+missing = [c for c in required if c not in summary_mid.columns]
+if missing:
+    raise KeyError(f"Missing required columns in summary_mid: {missing}")
+
+plot_df_top12 = summary_top.dropna(subset=['days_to_50pct','opening_screen_average','lifetime_total_scaled']).copy()
+
+# Plotting columns
+plot_df_top12['days_to_50pct'] = plot_df_top12['days_to_50pct'].clip(lower=0)
+plot_df_top12['days_plot'] = plot_df_top12['days_to_50pct']
+plot_df_top12['days_jitter'] = plot_df_top12['days_plot'] + np.random.normal(0, 0.15, size=len(plot_df_top12))
+
+# Scatter plot
+fig = px.scatter(plot_df_top12, x='days_jitter', y='opening_screen_average', color='state_group', opacity=0.6,
+    hover_name='title',
+    custom_data=['days_to_50pct', 'lifetime_total_scaled', 'numero_film_id'],
+    labels={'days_jitter':'Days to 50%','opening_screen_average':'Opening screen average', 'state_group': 'State'},
+    title='Top market: Days to 50% vs Opening')
+
+fig.update_traces(
+    marker=dict(size=8),
+    hovertemplate=(
+        "<b>%{hovertext}</b><br>" +
+        "Days to 50%: %{customdata[0]:.0f}<br>" +
+        "Opening avg: %{y:,.0f}<br>" +
+        "Lifetime gross: %{customdata[1]:,}<br>" +
+        "Film ID: %{customdata[2]}<extra></extra>"
+    ))
+
+fig.update_xaxes(range=[0,11], dtick=1)
+fig.add_vline(x=7, line=dict(color='red', dash='dash'), annotation_text='first week', annotation_position='top left')
+fig.update_layout(
+    template="plotly_white",
+    width=900,
+    height=420,
+    margin=dict(l=70, r=40, t=70, b=60)
+)
+fig.show()
+```
+
+:::
+::: {#secondcolumn}
+
+For the top market, the hits are spread across a much wider range of days and opening screen averages, which shows that some big titles still take longer to reach half of their lifetime gross. This reinforces the earlier point that opening strength on its own does not fully predict how a hit will perform over time.
+
+:::
+:::::
+
+
+## Days to reach 80%
+
+::::: {layout = "[20,80]"}
+::: {#firstcolumn}
+
+```{python}
+# Drop missing values and prepare plotting frame
+plot_df_8 = summary_mid.dropna(subset=['days_to_80pct']).copy()
+
+# Plot ECDF by state
+fig = go.Figure()
+for state in state_order:
+    grp = plot_df_8[plot_df_8["state_group"] == state]
+    x = np.sort(grp["days_to_80pct"].values)
+    n = len(x)
+    if n == 0:
+        continue
+    y = np.arange(1, n + 1) / n
+
+    fig.add_trace(
+        go.Scatter(x=x, y=y, mode="lines", line=dict(width=2),
+            name=f"{state} (n={n})",
+            line_shape="hv",
+            hovertemplate=(
+                "<b>%{text}</b><br>"
+                "Days to 80%: %{x}<br>"
+                "Proportion: %{y:.2f}<extra></extra>"
+            ),
+            text=[state] * n
+        )
+    )
+
+fig.update_xaxes(range=[0, 16], dtick=1, title_text="Days to reach 80%")
+fig.update_yaxes(range=[0, 1], title_text="Proportion of films", tickformat=".0%")
+fig.update_layout(
+    title="Mid market: ECDF of Days to 80% by State (Excluding Top 12 Hits)",
+    template="plotly_white",
+    width=900,
+    height=520,
+    legend=dict(title="State (n)", orientation="v", x=1.02, y=1),
+    margin=dict(l=60, r=260, t=70, b=60),
+    hoverlabel=dict(bgcolor="white", font_size=12)
+)
+
+fig.show()
+```
+
+:::
+::: {#secondcolumn}
+
+For the 80% milestone, the same approach is used. The mid market films follow a similar pattern to the 50% results, just stretched a few days further. Across the major states, most films climb toward the 80% mark quickly, with a large share reaching it by day 5. By around day 14, the vast majority have already captured most of their lifetime revenue. That tells us the typical mid market title earns almost everything it is going to earn within the first one to two weeks, and long tails are the exception rather than the rule. From a programming point of view, two weeks is a sensible horizon for deciding whether a film still deserves a broad footprint.
+:::
+:::::
+
+::::: {layout = "[20,80]"}
+::: {#firstcolumn}
+
+
+```{python}
+# Drop missing values and prepare plotting frame
+plot_df_8_top12 = summary_top.dropna(subset=['days_to_80pct']).copy()
+
+# plot ECDF by state
+fig = go.Figure()
+for state in state_order:
+    grp = plot_df_8_top12[plot_df_8_top12["state_group"] == state]
+    x = np.sort(grp["days_to_80pct"].values)
+    n = len(x)
+    if n == 0:
+        continue
+    y = np.arange(1, n + 1) / n
+
+    fig.add_trace(
+        go.Scatter(x=x, y=y, mode="lines", line=dict(width=2),
+            name=f"{state} (n={n})",
+            line_shape="hv",
+            hovertemplate=(
+                "<b>%{text}</b><br>"
+                "Days to 80%: %{x}<br>"
+                "Proportion: %{y:.2f}<extra></extra>"
+            ),
+            text=[state] * n
+        )
+    )
+
+fig.update_xaxes(range=[0, 20], dtick=1, title_text="Days to reach 80%")
+fig.update_yaxes(range=[0, 1], title_text="Proportion of films", tickformat=".0%")
+fig.update_layout(
+    title="Top market: ECDF of Days to 80% by State (Top 12 Hits)",
+    template="plotly_white",
+    width=900,
+    height=520,
+    legend=dict(title="State (n)", orientation="v", x=1.02, y=1),
+    margin=dict(l=60, r=260, t=70, b=60),
+    hoverlabel=dict(bgcolor="white", font_size=12)
+)
+
+fig.show()
+```
+
+:::
+::: {#secondcolumn}
+The top market behaves differently. The biggest titles show a much wider spread in how long they take to reach 80%, and several continue earning well beyond the 2 mark. This reinforces the earlier point that hits cannot be treated with the same rules as mid market films. Some of them are capable of sustaining meaningful revenue for many weeks, so decisions for this group should be guided by week to week retention rather than a fixed timeline.
+:::
+:::::
+
+::::: {layout = "[20,80]"}
+::: {#firstcolumn}
+
+```{python}
+# Boxplot
+fig = px.box(plot_df_8, x = "days_to_80pct", y = "state_group",
+    category_orders={"state_group": state_order},
+    labels={"days_to_80pct": "Days to reach 80%", "state_group": "State"},
+    title="Mid market: Distribution of Days to 80% by State (Excluding Top 12 Hits)",
+    color_discrete_sequence=["cornflowerblue"],
+    points="outliers"
+)
+fig.update_yaxes(autorange="reversed")
+fig.update_layout(
+    template="plotly_white",
+    width=900,
+    height=420,
+    margin=dict(l=140, r=40, t=70, b=60),
+    yaxis=dict(title="State", categoryorder="array", categoryarray=state_order)
+)
+fig.show()
+```
+
+:::
+::: {#secondcolumn}
+Looking at the boxplots for the mid market group, the medians cluster tightly around day 5 or 6 in the larger states, and the spread is narrow in New South Wales and Western Australia. That consistency shows that most films in these states follow a predictable early earning pattern. Victoria again shows more variation, with a wider range of days to reach 80%, which suggests that some titles there continue to earn for longer.
+:::
+:::::
+
+::::: {layout = "[20,80]"}
+::: {#firstcolumn}
+
+
+```{python}
+# Boxplot
+fig = px.box(plot_df_8_top12, x = "days_to_80pct", y = "state_group",
+    category_orders={"state_group": state_order},
+    labels={"days_to_80pct": "Days to reach 80%", "state_group": "State"},
+    title="Top market: Distribution of Days to 80% by State (Top 12 Hits)",
+    color_discrete_sequence=["cornflowerblue"],
+    points="outliers"
+)
+fig.update_xaxes(range=[0, 18], dtick=1)
+fig.update_yaxes(autorange="reversed")
+fig.update_layout(
+    template="plotly_white",
+    width=900,
+    height=420,
+    margin=dict(l=140, r=40, t=70, b=60),
+    yaxis=dict(title="State", categoryorder="array", categoryarray=state_order)
+)
+
+fig.show()
+```
+
+
+:::
+::: {#secondcolumn}
+
+The top market boxplots highlight how uneven the big titles can be. New South Wales and Victoria show wider distributions, while the smaller states only have single observations.
+
+:::
+:::::
+
+The scatter plot for the mid market group adds another layer by showing how opening strength relates to the time it takes to reach 80%. Most films reach the milestone within the first week, and they span a wide range of opening screen averages. 
+
+::::: {layout = "[20,80]"}
+::: {#firstcolumn}
+
+
+
+```{python}
+# Prepare data
+summary_mid.columns = summary_mid.columns.str.strip()
+
+# Columns check
+required = ['numero_film_id','days_to_80pct','opening_screen_average','lifetime_total_scaled','state_group','title']
+missing = [c for c in required if c not in summary_mid.columns]
+if missing:
+    raise KeyError(f"Missing required columns in summary_mid: {missing}")
+
+plot_df_8 = summary_mid.dropna(subset=['days_to_80pct','opening_screen_average','lifetime_total_scaled']).copy()
+plot_df_8 = plot_df_8.reset_index(drop=True)
+
+# Plotting columns
+plot_df_8['days_to_80pct'] = plot_df_8['days_to_80pct'].clip(lower=0)
+plot_df_8['days_plot'] = plot_df_8['days_to_80pct']
+plot_df_8['days_jitter'] = plot_df_8['days_plot'] + np.random.normal(0, 0.15, size=len(plot_df_8))
+
+# Scatter plot
+fig = px.scatter(plot_df_8, x='days_jitter', y='opening_screen_average', color='state_group', opacity=0.6,
+    hover_name='title',
+    custom_data=['days_to_80pct', 'lifetime_total_scaled', 'numero_film_id'],
+    labels={'days_jitter':'Days to 80%','opening_screen_average':'Opening screen average', 'state_group': 'State'},
+    title='Mid market: Days to 80% vs Opening')
+
+fig.update_traces(
+    marker=dict(size=8),
+    hovertemplate=(
+        "<b>%{hovertext}</b><br>" +
+        "Days to 80%: %{customdata[0]:.0f}<br>" +
+        "Opening avg: %{y:,.0f}<br>" +
+        "Lifetime gross: %{customdata[1]:,}<br>" +
+        "Film ID: %{customdata[2]}<extra></extra>"
+    ))
+
+fig.update_xaxes(range=[0,15], dtick=1)
+fig.add_vline(x=7, line=dict(color='red', dash='dash'), annotation_text='first week', annotation_position='top left')
+fig.update_layout(
+    template="plotly_white",
+    width=900,
+    height=420,
+    margin=dict(l=70, r=40, t=70, b=60)
+)
+fig.show()
+```
+
+:::
+::: {#secondcolumn}
+A few titles take longer despite modest openings, pointing again to slow burners that build through word of mouth. There is also an interesting pattern in Victoria, where films with higher opening screen averages tend to take longer to reach 80%. This reinforces the idea that opening strength is not a perfect predictor of long-term capture. The practical takeaway is to extend selectively when the opening per screen average is strong and week‑one retention looks healthy.
+
+:::
+:::::
+
+<br><br>
+
+::::: {layout = "[20,80]"}
+::: {#firstcolumn}
+
+
+```{python}
+# Prepare data
+summary_top.columns = summary_top.columns.str.strip()
+
+# Columns check
+required = ['numero_film_id','days_to_80pct','opening_screen_average','lifetime_total_scaled','state_group','title']
+missing = [c for c in required if c not in summary_mid.columns]
+if missing:
+    raise KeyError(f"Missing required columns in summary_mid: {missing}")
+
+plot_df_8_top12 = summary_top.dropna(subset=['days_to_80pct','opening_screen_average','lifetime_total_scaled']).copy()
+plot_df_8_top12 = plot_df_8_top12.reset_index(drop=True)
+
+# Plotting columns
+plot_df_8_top12['days_to_80pct'] = plot_df_8_top12['days_to_80pct'].clip(lower=0)
+plot_df_8_top12['days_plot'] = plot_df_8_top12['days_to_80pct']
+plot_df_8_top12['days_jitter'] = plot_df_8_top12['days_plot'] + np.random.normal(0, 0.15, size=len(plot_df_8_top12))
+
+# Scatter plot
+fig = px.scatter(plot_df_8_top12, x='days_jitter', y='opening_screen_average', color='state_group', opacity=0.6,
+    hover_name='title',
+    custom_data=['days_to_80pct', 'lifetime_total_scaled', 'numero_film_id'],
+    labels={'days_jitter':'Days to 80%','opening_screen_average':'Opening screen average', 'state_group': 'State'},
+    title='Top market: Days to 80% vs Opening')
+
+fig.update_traces(
+    marker=dict(size=8),
+    hovertemplate=(
+        "<b>%{hovertext}</b><br>" +
+        "Days to 80%: %{customdata[0]:.0f}<br>" +
+        "Opening avg: %{y:,.0f}<br>" +
+        "Lifetime gross: %{customdata[1]:,}<br>" +
+        "Film ID: %{customdata[2]}<extra></extra>"
+    ))
+
+fig.update_xaxes(range=[0,18], dtick=1)
+fig.add_vline(x=7, line=dict(color='red', dash='dash'), annotation_text='first week', annotation_position='top left')
+fig.update_layout(
+    template="plotly_white",
+    width=900,
+    height=420,
+    margin=dict(l=70, r=40, t=70, b=60)
+)
+fig.show()
+```
+
+:::
+::: {#secondcolumn}
+The top market scatter shows even more spread. Some hits take many weeks to reach 80%, no matter how strong their opening screen average is. The reason can be that their audience behaves differently. Large releases draw broader and more sustained segments, and their performance is shaped by factors like premium formats, repeat viewing, marketing waves, and staggered rollouts. These dynamics create longer tails, so even a powerful opening does not guarantee fast revenue capture.
+:::
+:::::
+
+## Summary
+Most mid market films earn the majority of their revenue very quickly. Half of them reach 50% of their lifetime gross within the first 3-4 days, and half reach 80% within the first week. The pattern is consistent across the larger states, especially New South Wales and Western Australia, where films are strongly front-loaded and follow a predictable early curve. Victoria shows more variation, with a mix of fast openers and slower building titles.
+
+Top market films behave differently. The time they need to reach milestones are far more spread out, and some hits take many weeks to reach 80% regardless of how strong their opening is. Their broader and more sustained audience segments, combined with factors like premium formats, repeat viewing, and staggered rollouts, create longer tails that break the mid market pattern.
+
+Taken together, the data show that most films generate the bulk of their revenue in the first week, while big hits require more flexible and case by case treatment.

@@ -1,0 +1,553 @@
+---
+title: "QUESTION 2: What is the optimal run length for films?"
+format:
+  html:
+    page-layout: full
+    embed-resources: true
+    toc: true
+    grid:
+      body-width: 1200px
+jupyter: python3
+echo: false
+warning: false
+---
+
+
+```{python}
+#| output: false
+import importlib
+import pre_processing as prep
+import sqlite3
+import json
+import datetime
+from tqdm import tqdm
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import matplotlib.ticker as ticker
+import matplotlib.dates as mdates
+import plotly.express as px
+from plotly.subplots import make_subplots
+import plotly.graph_objects as go
+from lifelines import KaplanMeierFitter
+from typing import Optional
+
+conn = prep.connect_db("numero_data.sqlite")
+
+# Load raw json
+df_raw = prep.load_raw_sales(conn)
+df_sales = prep.flatten_sales_json(df_raw)
+prep.save_df_to_csv(df_sales, "sales_processed.csv")
+
+# Dataset
+df_meta, df_titles = prep.load_metadata_and_titles(conn) 
+df = prep.join_sales_metadata(df_sales, df_meta, df_titles)
+df_run, longest, segments, tmp, film_dates = prep.extract_longest_continuous_run(df, gap_days=7)
+```
+
+
+Following question 1, question 2 examines the optimal run length that captures most revenue but does not tie up screens unnecessarily.
+
+To answer that I measured 3 complementary signals that map directly to scheduling decisions. Median daily gross with IQR shows where the value is concentrated. Day to day retention gives an early momentum signal you can act on within days. Kaplan Meier (KM) survival and median cumulative share summarize run longevity and when the market is effectively exhausted. Finally I used a marginal gain test and bootstrapped incremental dollars to quantify the practical payoff of holding beyond candidate cutoffs.
+
+```{python}
+# Excluding top 12
+top_12_ids = df.groupby('numero_film_id')['gross_today'].sum().sort_values(ascending=False).head(12).index.tolist()
+sales_mid_market = df[~df['numero_film_id'].isin(top_12_ids)]
+
+# Prepare data
+data = sales_mid_market.copy()
+data['actual_sales_date'] = pd.to_datetime(data['actual_sales_date'])
+data = data.sort_values(['numero_film_id','actual_sales_date'])
+
+# compute film first date and day index (day 1 = first sales date)
+data['first_date'] = data.groupby('numero_film_id')['actual_sales_date'].transform('min')
+data['day'] = (data['actual_sales_date'] - data['first_date']).dt.days + 1
+
+# daily
+daily = (df_run.groupby(['numero_film_id','day'], as_index=False)
+           .agg(daily_gross=('gross_today','sum'),
+                title=('title','first'),
+                state=('state','first'),
+                screens=('opening_screens','first')))
+
+daily = daily.sort_values(['numero_film_id','day'])
+daily['prev_gross'] = daily.groupby('numero_film_id')['daily_gross'].shift(1)
+daily.loc[daily['prev_gross'] == 0, 'prev_gross'] = np.nan
+daily['retention'] = (daily['daily_gross'] / daily['prev_gross']).replace([np.inf,-np.inf], np.nan)
+
+# sum of daily gross
+sum_by_film = daily.groupby('numero_film_id')['daily_gross'].sum().rename('sum_days').reset_index()
+meta = daily.groupby('numero_film_id', as_index=False).agg(lifetime_total=('daily_gross','sum'))
+
+daily = daily.merge(sum_by_film, on='numero_film_id', how='left')
+daily['lifetime_use'] = daily['lifetime_total'].fillna(daily['sum_days']) if 'lifetime_total' in daily.columns else daily['sum_days']
+daily.loc[daily['lifetime_use'] == 0, 'lifetime_use'] = np.nan
+daily['cum_gross'] = daily.groupby('numero_film_id')['daily_gross'].cumsum()
+daily['cum_share'] = (daily['cum_gross'] / daily['lifetime_use']).clip(0,1)
+
+# summaries by day
+day_summary = (daily.groupby('day').agg(
+    n_films=('numero_film_id','nunique'),
+    median_daily=('daily_gross','median'),
+    median_retention=('retention','median'),
+    p25_retention=('retention', lambda s: s.quantile(0.25)),
+    p75_retention=('retention', lambda s: s.quantile(0.75)),
+    median_cum_share=('cum_share','median')
+).reset_index())
+```
+
+```{python}
+df_run['actual_sales_date'] = pd.to_datetime(df_run['actual_sales_date'])
+df_run['gross_today'] = pd.to_numeric(df_run['gross_today'], errors='coerce').fillna(0)
+
+film_date = (
+    df_run.groupby(['numero_film_id','actual_sales_date'], as_index=False)
+          .agg(gross_today=('gross_today','sum'),
+               title=('title','first'),
+               state=('state','first'),
+               opening_screens=('opening_screens','first'),
+               opening_screen_average=('opening_screen_average','first'))
+)
+
+first_nonzero = (
+    film_date[film_date['gross_today'] > 0]
+      .groupby('numero_film_id', as_index=False)['actual_sales_date']
+      .min()
+      .rename(columns={'actual_sales_date':'first_sale_date'})
+)
+
+film_date = film_date.merge(first_nonzero, on='numero_film_id', how='left')
+film_date['has_sales'] = film_date['first_sale_date'].notna()
+film_date['day_from_first_sale'] = (film_date['actual_sales_date'] - film_date['first_sale_date']).dt.days + 1
+
+aligned = film_date[film_date['day_from_first_sale'].notna() & (film_date['day_from_first_sale'] >= 1)].copy()
+
+run_lifetime = aligned.groupby('numero_film_id', as_index=False)['gross_today'].sum().rename(columns={'gross_today':'run_lifetime'})
+
+daily = (
+    aligned.groupby(['numero_film_id','day_from_first_sale'], as_index=False)
+           .agg(daily_gross=('gross_today','sum'),
+                title=('title','first'),
+                state=('state','first'),
+                screens=('opening_screens','first'))
+)
+
+daily = daily.merge(run_lifetime, on='numero_film_id', how='left')
+daily = daily.sort_values(['numero_film_id','day_from_first_sale'])
+daily['cum_gross'] = daily.groupby('numero_film_id')['daily_gross'].cumsum()
+daily['cum_share'] = daily['cum_gross'] / daily['run_lifetime']
+daily.loc[daily['run_lifetime'] == 0, 'cum_share'] = np.nan  
+```
+
+
+::::: {layout = "[20,80]"}
+::: {#firstcolumn}
+
+```{python}
+# Median daily gross with IQR
+med = daily.groupby('day_from_first_sale')['daily_gross'].median()/1e6
+q1 = daily.groupby('day_from_first_sale')['daily_gross'].quantile(0.25)/1e6
+q3 = daily.groupby('day_from_first_sale')['daily_gross'].quantile(0.75)/1e6
+days = np.sort(med.index.to_numpy())
+
+# Plot
+fig = go.Figure()
+
+# Upper line
+fig.add_trace(go.Scatter(x=days, y=q3, mode='lines',
+    line=dict(color='rgba(0,0,0,0)'),
+    showlegend=False,
+    hoverinfo='skip'
+))
+
+# Lower line
+fig.add_trace(go.Scatter(x=days, y=q1, mode='lines',
+    line=dict(color='rgba(0,0,0,0)'), fill='tonexty', fillcolor='rgba(100,149,237,0.18)', 
+    showlegend=False,
+    hoverinfo='skip'
+))
+
+# Median line
+customdata = np.stack([q1, med, q3], axis=1)
+fig.add_trace(go.Scatter(x=days, y=med, mode='lines+markers',
+    line=dict(color='cornflowerblue', width=2), marker=dict(size=6), name='Median',
+    customdata=customdata,
+    showlegend=False,
+    hovertemplate=(
+        "Day since first sale: %{x}<br>"
+        "Median daily gross: %{y:.2f}<br>"
+        "Q1: %{customdata[0]:.2f}<br>"
+        "Q3: %{customdata[2]:.2f}<extra></extra>"
+    )
+))
+
+fig.update_layout(
+    title='Median daily gross with IQR (aligned to first sale)',
+    xaxis_title='Day since first sale',
+    yaxis_title='Median daily gross',
+    template='plotly_white',
+    width=900,
+    height=420,
+    margin=dict(l=60, r=40, t=60, b=60),
+    hoverlabel=dict(bgcolor='white', font_size=12)
+)
+
+fig.update_xaxes(range=[1, 20], dtick=1)
+
+fig.show()
+```
+
+:::
+::: {#secondcolumn}
+
+When aligned to first sale the median daily gross peaks on day 2 and then falls sharply. The IQR is widest around day 3, meaning opening variability is high but the market narrows quickly. There is a smaller secondary slope from days 7-14, and the series is almost flat after day 14.
+
+:::
+:::::
+
+-> Most incremental revenue is captured in the opening week, so concentrate screens and marketing on day 1-7 and use days 3-7 as the primary signal for hold versus clear. Watch days 7-14 for slow burners that may justify a short extension. Treat extensions beyond day 14 as exceptions reserved for films that show clear, sustained momentum.
+
+<br>
+
+To understand why these patterns emerge at the daily level, the next step is to look at day to day retention. Day to day retention measures how much a film earns on day t relative to day t minus 1. A median retention at or above 1 means the typical film is holding or growing, while a median below 1 signals decay.
+
+::::: {layout = "[20,80]"}
+::: {#firstcolumn}
+
+```{python}
+# Retention boxplot
+daily = daily.sort_values(['numero_film_id', 'day_from_first_sale']).copy()
+daily['prev_gross'] = daily.groupby('numero_film_id')['daily_gross'].shift(1)
+daily.loc[daily['prev_gross'] == 0, 'prev_gross'] = np.nan
+daily['retention'] = (daily['daily_gross'] / daily['prev_gross']).replace([np.inf, -np.inf], np.nan)
+
+plot_df = daily[daily['day_from_first_sale'].between(2, 40)].copy()
+days = sorted(plot_df['day_from_first_sale'].unique())
+
+fig = go.Figure()
+
+# Boxplots
+for d in days:
+    sub = plot_df[plot_df['day_from_first_sale'] == d]
+    fig.add_trace(go.Box(
+        x=[d] * len(sub), 
+        y=sub['retention'],
+        name=str(d),
+        boxpoints='outliers',
+        marker_color='lightsteelblue',
+        showlegend=False
+    ))
+
+# Median line
+med = plot_df.groupby('day_from_first_sale')['retention'].median().reindex(days).to_numpy()
+fig.add_trace(go.Scatter( x=days, y=med, mode='lines+markers',
+    line=dict(color='cornflowerblue', width=2), marker=dict(size=6),
+    showlegend=False,
+    hovertemplate='Day: %{x}<br>Median: %{y:.2f}<extra></extra>'
+))
+
+fig.add_hline(y=1.0, line=dict(color='red', dash='dash', width=0.8))
+fig.add_hline(y=0.5, line=dict(color='red', dash='dash', width=0.8))
+
+fig.update_xaxes(title='Day since first sale', tickmode='array', tickvals=days)
+fig.update_yaxes(range=[0, 2.5], title='Retention (Day n / Day n-1)')
+fig.update_layout(
+    title='Distribution of day-to-day retention ratios',
+    template='plotly_white', width=1000, height=420, margin=dict(l=60, r=70, t=70, b=60))
+fig.show()
+```
+
+:::
+::: {#secondcolumn}
+
+Median retention falls quickly in the first days and the median drops below 1 within the first few days. By day 3-7 the median is often well under 1 and by day 9 most films show weak retention. Retention also shows periodic spikes roughly every seven days (days 9, 16, 23, 30, 37), reflecting a weekly rhythm rather than sustained growth.
+
+:::
+:::::
+
+-> Use retention as an early, actionable signal but interpret it with care. Strong retention in days 3-7 supports holding or expanding a title, while weak retention by day 2-3 argues for early clearance. Because retention can be biased by how many films remain on a given day, treat single day spikes (especially later in the run) as likely seasonal or sample size artifacts rather than proof of momentum, and combine retention with other metrics before deciding to cut or extend.
+
+<br>
+
+Next, I used Kaplan Meier (KM) to estimate the probability a film is still running on each day since its first positive gross, treating the longest continuous segment as the run and accounting for censoring. The KM curve gives a robust view of run longevity while the median cumulative share line shows how quickly revenue is captured.
+
+::::: {layout = "[20,80]"}
+::: {#firstcolumn}
+
+```{python}
+# Data
+film_days = (
+    aligned.groupby('numero_film_id', as_index=False)
+           .agg(first_date=('actual_sales_date', 'min'),
+                last_date=('actual_sales_date', 'max'))
+)
+film_days['duration_days'] = (film_days['last_date'] - film_days['first_date']).dt.days + 1
+film_days['event_observed'] = (film_days['last_date'] < aligned['actual_sales_date'].max()).astype(int)
+
+# Fit KM
+kmf = KaplanMeierFitter()
+kmf.fit(durations=film_days['duration_days'], event_observed=film_days['event_observed'], label='All films')
+
+# Survival function and CI
+km_sf = kmf.survival_function_['All films']
+km_ci = kmf.confidence_interval_ 
+
+# Median cumulative share by day
+wide = daily.pivot_table(
+    index='numero_film_id',
+    columns='day_from_first_sale',
+    values='cum_share',
+    aggfunc='max').sort_index(axis=1)
+
+wide = wide.ffill(axis=1)
+wide.columns = [f'cum_{int(c)}' for c in wide.columns]
+capture = wide.reset_index()
+
+days = sorted([int(c.split('_')[1]) for c in capture.columns if c.startswith('cum_')])
+medians = {d: np.nanmedian(capture[f'cum_{d}'].values) for d in days}
+med_series = pd.Series(medians).sort_index()
+
+# Align both series
+max_day = int(max(km_sf.index.max(), med_series.index.max()))
+x_days = np.arange(1, max_day + 1)
+
+km_y = km_sf.reindex(x_days, method='ffill').fillna(1.0).to_numpy()
+ci_lower = km_ci[f'{kmf._label}_lower_0.95'].reindex(x_days, method='ffill').fillna(1.0).to_numpy()
+ci_upper = km_ci[f'{kmf._label}_upper_0.95'].reindex(x_days, method='ffill').fillna(1.0).to_numpy()
+
+med_y = med_series.reindex(x_days).to_numpy()
+
+# Plot
+fig = make_subplots(specs=[[{"secondary_y": True}]])
+
+# KM confidence band
+fig.add_trace(
+    go.Scatter(x=x_days, y=ci_upper, mode='lines', line=dict(color='rgba(0,0,0,0)'), showlegend=False),
+    secondary_y=False
+)
+fig.add_trace(
+    go.Scatter(x=x_days, y=ci_lower, mode='lines', fill='tonexty',
+               fillcolor='rgba(100,149,237,0.18)', line=dict(color='rgba(0,0,0,0)'),
+               name='KM 95% CI'),
+    secondary_y=False
+)
+
+# KM survival line
+fig.add_trace(
+    go.Scatter(x=x_days, y=km_y, mode='lines+markers',
+               line=dict(color='cornflowerblue', width=2), marker=dict(size=4),
+               name='Survival (KM)',
+               hovertemplate='Day: %{x}<br>Survival: %{y:.3f}<extra></extra>'),
+    secondary_y=False
+)
+
+# Median cumulative share
+fig.add_trace(
+    go.Scatter(x=x_days, y=med_y, mode='lines+markers',
+               line=dict(color='seagreen', width=2), marker=dict(size=6),
+               name='Median cumulative share',
+               hovertemplate='Day: %{x}<br>Median cum. share: %{y:.3f}<extra></extra>'),
+    secondary_y=True
+)
+
+# Reference line
+fig.add_hline(y=0.5, line=dict(color='red', dash='dash', width=0.8), row=1, col=1)
+
+fig.update_xaxes(title_text='Days since first sale',range=[0, 70], tickmode='linear', dtick=7)
+fig.update_yaxes(title_text='Probability film still running (KM)', range=[0, 1.05], secondary_y=False)
+fig.update_yaxes(title_text='Median cumulative share', range=[0, 1.05], secondary_y=True)
+
+fig.update_layout(
+    title='Film Survival (KM) and Median Cumulative Revenue Capture',
+    template='plotly_white',
+    width=1100,
+    height=500,
+    legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
+    margin=dict(l=60, r=60, t=80, b=60)
+)
+
+fig.show()
+```
+
+
+:::
+::: {#secondcolumn}
+
+The KM survival curve drops steeply in the early days and reaches the 50% mark around day 20, then develops a long, shallow tail that flattens after roughly day 40. The median cumulative revenue share rises rapidly in the first 2 weeks and plateaus well before the survival curve reaches its long tail.
+
+:::
+:::::
+
+-> About half of films exit by around day 20, so a 20 day default evaluation window is defensible. The median cumulative revenue plateaus well before the survival curve’s long tail, which means most dollars are captured long before many films actually leave screens. Long runs beyond the plateau usually add little value. Reserve extensions past day 20-40 only for titles that pass retention and marginal gain checks. Late survival estimates are noisier because fewer films remain, so treat late survival and small sample behavior as less reliable and require corroborating metrics before acting.
+
+<br>
+
+However, earlier results from question 1 pointed to an upper bound near day 14, so I rechecked using the longest continuous run and median cumulative share. 
+
+::::: {layout = "[20,80]"}
+::: {#firstcolumn}
+
+
+```{python}
+# Marginal median gain
+delta = med_series.diff().fillna(med_series.iloc[0])
+
+epsilon = 0.005
+candidates = delta[delta < epsilon]
+candidate_day = int(candidates.index.min()) if not candidates.empty else None
+
+days = delta.index.to_numpy(dtype=int)
+delta_vals = delta.to_numpy()
+
+fig = go.Figure()
+# Marginal gain line
+fig.add_trace(go.Scatter(x=days, y=delta_vals, mode='lines+markers',
+    line=dict(color='cornflowerblue', width=2), marker=dict(size=6),
+    hovertemplate='Day: %{x}<br>Marginal gain: %{y:.4f}<extra></extra>'
+))
+
+# Epsilon line
+fig.add_hline(y=epsilon, line=dict(color='red', dash='dash', width=1.2),
+    annotation_text=f'epsilon = {epsilon}', 
+    annotation_position='top left', annotation_font=dict(color='red'),
+    row='all', col='all'
+)
+
+# Candidate day line
+if candidate_day is not None:
+    fig.add_vline(x=candidate_day, line=dict(color='green', dash='dash', width=1.2),
+        annotation_text=f'candidate day = {candidate_day}',
+        annotation_position='top right', annotation_font=dict(color='green'),
+        row='all', col='all'
+    )
+
+fig.update_layout(
+    title='Median marginal gain by day',
+    xaxis_title='Day since first sale',
+    yaxis_title='Median marginal gain',
+    template='plotly_white',
+    width=900,
+    height=420,
+    margin=dict(l=60, r=40, t=70, b=60),
+    legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1)
+)
+
+fig.show()
+```
+
+:::
+::: {#secondcolumn}
+
+The series flattens by about day 20, but the marginal improvement in cumulative share effectively ends near day 14. I formalized this with a marginal gain test: pick the first day 
+d where the median additional share from one more day, Δd, is below 𝜀. Using 𝜀 = 0.005 (0.5% points - it's chosen because it marks a practical flattening of the curve while avoiding noise driven decisions) means the median film gains less than half a percent of its lifetime revenue by adding another day. The test flags day 14 as the candidate cutoff.
+
+:::
+:::::
+
+-> Day 14 is a defensible early cutoff for marginal revenue. For the typical film, extra days after 14 add almost no share. Use day 14 as a trigger for a formal review rather than an automatic cut. Because the cumulative share only fully flattens by about day 20 and a small number of films still earn materially after day 14, we should also combine the marginal gain test with bootstrapped confidence intervals and the incremental dollars distribution before acting. In practice, treat day 14 as the first low value signal, hold a default evaluation window to day 20, and extend beyond day 20 only for films that pass retention, marginal gain, and impact checks.
+
+<br>
+
+Because the median looks flat across multiple days, a single fixed upper bound is hard to justify without explicitly trading off median behavior against tail risk. Therefore, I bootstrapped 95% confidence intervals for the median cumulative share at candidate days between day 14 and day 20 and computed the median difference between those days. I also converted cumulative share into incremental dollars for the 6 days after each candidate cutoff and plotted the empirical cumulative distribution.
+
+```{python}
+# Bootstrapping
+def bootstrap_median(arr, n_boot=2000):
+    """estimate a 95% CI for the median of an array using resampling"""
+    arr = arr[~np.isnan(arr)]
+    boots = []
+    for _ in range(n_boot):
+        s = np.random.choice(arr, size=len(arr), replace=True)
+        boots.append(np.median(s))
+    return np.percentile(boots, [2.5,97.5])
+
+# candidate day and candidate_day+6
+d = int(candidate_day)
+arr_d = capture[f'cum_{d}'].values
+arr_d6 = capture[f'cum_{d+6}'].values if f'cum_{d+6}' in capture.columns else np.full(len(capture), np.nan)
+ci_d = bootstrap_median(arr_d)
+ci_d5 = bootstrap_median(arr_d6)
+
+# incremental dollars day d to d+6
+run_lifetime = daily.groupby('numero_film_id', as_index=False)['run_lifetime'].first()
+inc = capture.merge(run_lifetime, on='numero_film_id', how='left')
+inc['inc_share_d_d6'] = inc[f'cum_{d+6}'] - inc[f'cum_{d}']
+inc['inc_dollars_d_d6'] = inc['inc_share_d_d6'] * inc['run_lifetime']
+
+# ECDF data
+ecdf_vals = inc['inc_dollars_d_d6'].dropna().to_numpy()
+sorted_x = np.sort(ecdf_vals)
+n = len(sorted_x)
+y = np.arange(1, n + 1) / n
+
+# Transform inline: sign(x) * log10(1 + |x|/linthresh)
+abs_median = np.median(np.abs(sorted_x)) if np.any(np.isfinite(sorted_x)) else 1.0
+linthresh = max(abs_median * 0.01, 1.0)
+x_trans = (np.sign(sorted_x) * np.log10(1.0 + np.abs(sorted_x) / linthresh)).tolist()
+
+# Tick values in original scale
+min_x, max_x = np.nanmin(sorted_x), np.nanmax(sorted_x)
+mag = np.log10(max(1.0, max(abs(min_x), abs(max_x))))
+powers = np.unique(np.round(np.linspace(0, mag, min(8, int(np.ceil(mag)) + 1))).astype(int))
+tick_vals_orig = {0.0}
+for p in powers:
+    for base in [1, 2, 5]:
+        tick_vals_orig.add(base * (10 ** p))
+        tick_vals_orig.add(-base * (10 ** p))
+tick_vals_orig = sorted([t for t in tick_vals_orig if (t >= min_x and t <= max_x) or t == 0.0])
+
+tick_vals_orig = np.array(tick_vals_orig, dtype=float)
+tick_vals_trans = (np.sign(tick_vals_orig) * np.log10(1.0 + np.abs(tick_vals_orig) / linthresh)).tolist()
+
+# Format tick labels
+tick_vals_orig_M = tick_vals_orig / 1e6
+tick_text = []
+for v in tick_vals_orig_M:
+    if abs(v) >= 1:
+        tick_text.append(f"{v:,.0f}M")
+    elif abs(v) >= 0.1:
+        tick_text.append(f"{v:,.1f}M")
+    else:
+        tick_text.append(f"${(v*1e6):,.0f}")
+
+# Plot
+fig = go.Figure()
+fig.add_trace(go.Scatter(
+    x=x_trans,
+    y=y,
+    mode='lines+markers',
+    marker=dict(size=6, color='cornflowerblue'),
+    line=dict(color='cornflowerblue', width=1.5),
+    name='ECDF'
+))
+
+idx = np.linspace(0, len(tick_vals_trans)-1, 8, dtype=int) 
+tickvals_sub = [tick_vals_trans[i] for i in idx] 
+ticktext_sub = [tick_text[i] for i in idx]
+
+fig.update_xaxes(
+    title_text=f'Incremental dollars (day {d} to {d+6})',
+    tickmode='array',
+    tickvals=tickvals_sub,
+    ticktext=ticktext_sub ,
+    range=[0, 4]
+)
+fig.update_yaxes(title_text='ECDF', range=[0, 1.02])
+
+fig.update_layout(
+    title=f'ECDF of incremental dollars (d={d} to d+6={d+6})', 
+    template='plotly_white',
+    width=900,
+    height=420,
+    margin=dict(l=60, r=20, t=70, b=60)
+)
+
+fig.show()
+```
+
+-> The ECDF rises steeply near zero, so most films add almost no revenue between day 14 and day 20. At the same time there is a long right tail, meaning a small share of films still earn substantial dollars after the cutoff. This supports treating day 14 as the first low value signal and triggering a formal review. Hold films until day 20 as the default evaluation window unless retention, marginal gain and incremental dollar checks justify an earlier cut. Allow exceptions for titles with clear upside or special events, and require a minimum sample size or wider confidence intervals before acting on late day estimates. This balances capturing the typical case while protecting the small number of films that still earn meaningful revenue after the apparent plateau.
+
+## Summary
+Taken together, the evidence supports a default run of 20 days, with early clearance at 14 days for clear underperformers and extensions to max 40 days only for films that show strong momentum or are top openers. It may help to make every decision conditional and auditable by defining numeric thresholds.
