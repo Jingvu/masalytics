@@ -1,14 +1,21 @@
 ---
-title: VISUALIZATION
+title: "Analysis of Indian Films (2025)"
 format:
   html:
+    page-layout: full
     embed-resources: true
     toc: true
-echo: false
+    grid:
+        body-width: 1200px
 jupyter: python3
+echo: false
+warning: false
 ---
 
+# Overview
+The first step of this project is a structured exploration of the 2025 Indian box office dataset to understand its shape, clean the inputs, and establish the basic patterns in demand. This includes a set of overview visualisations that help detect seasonality, weekly behaviour, blockbuster effects, and early signals in distributor and location performance. These foundations give us the clarity we need before moving into deeper insights and answering the key business questions for Film Viet Australia.
 
+# Visualization
 ```{python}
 #| output: false
 import importlib
@@ -26,6 +33,7 @@ import matplotlib.dates as mdates
 import plotly.express as px
 from plotly.subplots import make_subplots
 import plotly.graph_objects as go
+from IPython.display import HTML, display
 
 conn = prep.connect_db("numero_data.sqlite")
 
@@ -43,6 +51,9 @@ df_run, longest, segments, tmp, film_dates = prep.extract_longest_continuous_run
 ## Seasonality and Event Dynamics
 
 To get a first sense of the dataset, I started by looking at total demand across the year. This line chart compares total, weekend, and weekday gross by month. 
+
+::::: {layout = "[70,30]"}
+::: {#firstcolumn}
 
 ```{python}
 df["weekend_gross_component"] = df["gross_today"].where(df["is_weekend_numero"], 0)
@@ -95,11 +106,14 @@ fig.update_layout(
     hoverlabel=dict(bgcolor="white", font_size=13))
 ```
 
+:::
+::: {#secondcolumn}
 -> There is a clear spike in the middle of the year, especially in August, and most of that lift comes from the weekend line. This shows that Indian demand is strongly seasonal and very dependent on weekends.\
 (As a note, “weekend” here is defined as Friday, Saturday and Sunday.)
+:::
+:::::
 
 Next, I broke the monthly trend into how many films we release and how strong they are. In this combo chart, the bars show the number of films per month, and the red line shows the median daily gross per film. \
--> Around July and August, we do not just release more titles, those films also earn more per day. This supports the idea that mid year is a highly competitive release window.
 
 ```{python}
 # Films count with median daily gross by month
@@ -137,6 +151,10 @@ month_stats["month_label"] = month_stats["month"].dt.strftime("%b")
 
 month_stats["median_M"] = month_stats["median_daily_gross"] / 1e6
 ```
+
+-> Around July and August, we do not just release more titles, those films also earn more per day. This supports the idea that mid year is a highly competitive release window.
+
+<br>
 
 ```{python}
 # Plot
@@ -197,8 +215,12 @@ fig.update_yaxes(title_text="Median daily gross ($ millions)", secondary_y=True)
 fig.show()
 ```
 
+<br>
+
 To understand behaviour within the week, this bar chart shows total gross by day of week. \
--> Revenue begins to rise on Thursday, reaches its highest point on Friday and Saturday, and then softens on Sunday. This pattern confirms that Friday and Saturday are the core commercial days where screens and audience attention matter most. This also fits with common industry practice, since new films typically open on Friday, making it the first full day of audience demand and the natural peak of weekly cinema activity.
+
+::::: {layout = "[70,30]"}
+::: {#firstcolumn}
 
 ```{python}
 dow_labels = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
@@ -245,8 +267,16 @@ fig.update_layout(
 fig.show()
 ```
 
-To understand behaviour within the week, this bar chart shows total gross by day of week. Revenue rises from Thursday, peaks on Friday and Saturday, and softens on Sunday. This confirms that Friday and Saturday are the key days where screens and audience attention matter most.
+:::
+::: {#secondcolumn}
 
+-> Revenue begins to rise on Thursday, reaches its highest point on Friday and Saturday, and then softens on Sunday. This pattern confirms that Friday and Saturday are the core commercial days where screens and audience attention matter most. This also fits with common industry practice, since new films typically open on Friday, making it the first full day of audience demand and the natural peak of weekly cinema activity.
+
+:::
+:::::
+
+::::: {layout = "[70,30]"}
+::: {#firstcolumn}
 ```{python}
 # Weekly trend
 weekly_gross = df.groupby('week_start_date')['gross_today'].sum().reset_index()
@@ -293,10 +323,17 @@ fig.update_layout(
 fig.show()
 ```
 
+:::
+::: {#secondcolumn}
+The weekly revenue series shows sharp spikes in March, May, August and October, with the largest peak in August. These peaks are much higher than the baseline, indicating the market is event driven rather than steadily growing.
+
+:::
+:::::
+
 ## Market Without Blockbusters
 
 Since the industry is often shaped by a few major blockbusters, I wanted to avoid making any biased assumptions based on those titles alone. To do that, I began by examining the full distribution of film performance rather than jumping straight to the biggest hits. The boxplot of total gross per film makes the imbalance in the market very clear.\
--> Most titles sit tightly in a low range, while a long tail of outliers stretches far above the median. This shows that the typical film earns modestly, and only a small group of titles is responsible for lifting the entire market.
+
 
 ```{python}
 # Boxplot
@@ -332,8 +369,13 @@ fig.update_layout(
 fig.show()
 ```
 
+-> Most titles sit tightly in a low range, while a long tail of outliers stretches far above the median. This shows that the typical film earns modestly, and only a small group of titles is responsible for lifting the entire market.
+
+<br>
+
 To understand who these heavy hitters are, the next chart isolates the top 12 films by total gross. Titles such as Kantara A Legend: Chapter 1 and Saiyaara rise far above the rest, confirming that a handful of releases are doing most of the work in the 2025 Indian box office. This sets up the next step of the analysis, where I remove these outliers to see how the market behaves without the influence of blockbuster noise.
 
+::: {layout-ncol=2 .colum-screen-insert}
 ```{python}
 # Top performing films (by revenue)
 film_perf = (
@@ -397,9 +439,37 @@ film_dates = (
     .rename(columns={'min': 'release_date', 'max': 'last_showing'})
 )
 film_perf_with_dates = film_perf.merge(film_dates, on='title', how='left')
-display(film_perf_with_dates[['title', 'total_gross', 'release_date', 'last_showing', 'percent_of_total']])
+
+# Format and display top 12 table
+film_perf_with_dates = film_perf_with_dates.sort_values('total_gross', ascending=False).reset_index(drop=True)
+film_perf_with_dates['Rank'] = film_perf_with_dates.index + 1
+
+# Format columns
+film_perf_with_dates['total_gross'] = film_perf_with_dates['total_gross'].apply(lambda v: f"${v/1e6:,.1f}M" if pd.notna(v) else "")
+film_perf_with_dates['percent_of_total'] = film_perf_with_dates['percent_of_total'].apply(lambda v: f"{v:.1f}%" if pd.notna(v) else "")
+film_perf_with_dates['release_date'] = pd.to_datetime(film_perf_with_dates['release_date']).dt.strftime('%Y-%m-%d')
+film_perf_with_dates['last_showing'] = pd.to_datetime(film_perf_with_dates['last_showing']).dt.strftime('%Y-%m-%d')
+
+# Rename
+display_cols = {
+    'Rank': 'Rank',
+    'title': 'Title',
+    'release_date': 'Release date',
+    'last_showing': 'Last showing',
+    'total_gross': 'Total gross ($)',
+    'percent_of_total': 'Share (%)'
+}
+film_perf_with_dates.rename(columns=display_cols, inplace=True)
+cols_order = ['Rank','Title','Release date','Last showing','Total gross ($)','Share (%)']
+
+caption = f"Top 12 Indian films in Australia 2025. Sample size: {len(film_gross)} films."
+html = film_perf_with_dates[cols_order].to_html(index=False, escape=False)
+display(HTML(html))
 ```
 
+:::
+
+<br>
 To avoid biased conclusions driven by a few blockbusters, I removed the top 12 films by total gross and reanalyzed the same weekly and monthly metrics. This is a simple counterfactual test that compares the market with and without the biggest outliers to show how much they distort the overall picture.
 
 ```{python}
@@ -413,13 +483,25 @@ total_market_gross = df['gross_today'].sum()
 mid_market_gross = sales_mid_market['gross_today'].sum()
 drop_off = (1 - (mid_market_gross / total_market_gross)) * 100
 
-print(f"Without Top 12 films, we removed {drop_off:.1f}% of the total revenue.")
-print(f"Original Market Size: ${total_market_gross:,.0f}")
-print(f"Remaining Market Size: ${mid_market_gross:,.0f}")
+summary_display = pd.DataFrame({
+    'Metric': ['Original market size', 'Remaining market size', 'Share removed'],
+    'Value': [total_market_gross, mid_market_gross, drop_off]
+})
+
+# Format values for display
+summary_display['Value'] = summary_display.apply(
+    lambda r: f"${int(r.Value):,}" if r.Metric != 'Share removed' else f"{r.Value:.1f}%", axis=1
+)
+
+caption = "Market size with and without top 12 films"
+html_market = summary_display.to_html(index=False, escape=False)
+display(HTML(f"<div><strong>{caption}</strong></div>" + html_market))
+
 ```
 
-The results show that removing the top 12 films eliminated nearly 50% of total revenue. The weekly revenue series that once showed dramatic spikes now becomes largely flat. The large peaks in March, August, and October disappear or shrink dramatically and the baseline between peaks falls to a much lower level.
 
+::::: {layout = "[70,30]"}
+::: {#firstcolumn}
 ```{python}
 # Daily aggregates
 daily_total = df.groupby('actual_sales_date', as_index=False)['gross_today'].sum()
@@ -479,15 +561,19 @@ fig.update_layout(
 fig.show()
 ```
 
--> This change tells a clear story. The apparent volatility and the large seasonal spikes are not the result of steady shifts in audience habit. They are the result of a small number of event films. In other words, the market is event driven rather than habit driven. When a blockbuster opens, it creates a large temporary surge. When no blockbuster is present, the market reverts to a low baseline.
+:::
+::: {#secondcolumn}
+The results show that removing the top 12 films eliminated nearly 50% of total revenue. The weekly revenue series that once showed dramatic spikes now becomes largely flat. The large peaks in March, August, and October disappear or shrink dramatically and the baseline between peaks falls to a much lower level.
+:::
+:::::
+
+This change tells a clear story. The apparent volatility and the large seasonal spikes are not the result of steady shifts in audience habit. They are the result of a small number of event films. In other words, the market is event driven rather than habit driven. When a blockbuster opens, it creates a large temporary surge. When no blockbuster is present, the market reverts to a low baseline.
 
 This finding has important implications for both planning and operations. If we rely on simple trend models that ignore outliers, we will overestimate the true baseline and underestimate how volatile the market really is. Blockbusters behave like separate events, and forecasts need to treat them that way.
 
 From an operational point of view, the industry can run more effectively in two different modes. During event windows, competition for screens is intense and the market surges. During non event windows, the average film struggles to attract audiences and the baseline drops sharply. Understanding which mode we are in is essential for accurate forecasting, smarter scheduling, and better allocation of screens.
-
+<br><br>
 Even though hits dominate the peaks, I suspected there might still be underlying seasonality.
-
--> ACF and PACF tests confirm repeated patterns, showing that while blockbusters drive the peaks, the baseline market still follows a seasonal rhythm worth exploring further.
 
 ```{python}
 import statsmodels.api as sm
@@ -552,12 +638,15 @@ fig.update_layout(
 
 fig.show()
 ```
+-> ACF and PACF tests confirm repeated patterns, showing that while blockbusters drive the peaks, the baseline market still follows a seasonal rhythm worth exploring further.
 
+<br>
 Next, I looked at who benefits most from this structure by looking at Top 10 Distributors. 
 
 ## Distributor Performance and Circuit Concentration
 The data shows Mindblowing Films is the dominant distributor.
 
+::: {layout-ncol=2 .colum-screen-insert}
 ```{python}
 # Top 10 Distributors
 dist_market_share = (
@@ -616,15 +705,33 @@ dist_stats = (
       .sort_values("total_gross", ascending=False)
 )
 
-dist_stats["avg_gross_per_film"] = dist_stats["avg_gross_per_film"] / 1e6
-dist_stats_top = dist_stats.head(10)
-dist_stats["total_gross"] = dist_stats["total_gross"] / 1e6
-grand_total = dist_stats["total_gross"].sum()
-dist_stats_top["percent_of_total"] = (dist_stats["total_gross"] / grand_total) *100
+# Top 10 
+dist_stats_top = dist_stats.head(10).copy()
+grand_total = dist_stats['total_gross'].sum()
+dist_stats_top['percent_of_total'] = (dist_stats_top['total_gross'] / grand_total) * 100
+dist_stats_top = dist_stats_top.sort_values('total_gross', ascending=False).reset_index(drop=True)
 
-display(dist_stats_top[["distributor", "total_gross", "percent_of_total", "avg_gross_per_film"]]
-          .round({"total_gross": 2, "percent_of_total": 2, "avg_gross_per_film":2}))
+# Rename columns
+dist_stats_top.rename(columns={
+    'distributor': 'Distributor',
+    'total_gross': 'Total gross (raw)',
+    'num_films': 'Number of films',
+    'avg_gross_per_film': 'Avg gross per film (raw)',
+    'percent_of_total': 'Share (%)'
+}, inplace=True)
+
+# Format
+dist_stats_top['Total gross ($)'] = dist_stats_top['Total gross (raw)'].apply(lambda v: f"${v/1e6:,.1f}M")
+dist_stats_top['Avg gross per film ($)'] = dist_stats_top['Avg gross per film (raw)'].apply(lambda v: f"${v/1e6:,.1f}M")
+dist_stats_top['Share (%)'] = dist_stats_top['Share (%)'].apply(lambda v: f"{v:.1f}%")
+
+cols = ['Distributor','Total gross ($)','Number of films','Avg gross per film ($)','Share (%)']
+caption = "Top distributors by gross"
+html = dist_stats_top[cols].to_html(index=False, escape=False)
+display(HTML(f"<div><strong>{caption}</strong></div>" + html))
 ```
+
+:::
 
 And even after removing the top 12 films, they still remain number one.
 However, without the outliers, Tolly Movies becomes much closer to Mindblowing.
@@ -673,11 +780,9 @@ fig.update_layout(
 fig.show()
 ```
 
+<br>
+
 If state and city patterns tell us where audiences live, the distributor by circuit view shows how those audiences are reached. The heatmap below shows which distributors earn most with which cinema circuits. 
-
--> Mindblowing, Tolly Movies and Forum Distribution dominate Hoyts and also perform strongly at Event and Village, while circuits like United, Reading and ICA contribute very little for most distributors. 
-
--> **Recommendation**: Prioritise targeted partnerships and pilots with the circuits that already convert well for each distributor, and run controlled tests in underperforming circuits to determine whether low revenue is due to supply or demand. Treat concentrated wins as both an opportunity and a risk because they can deliver fast returns but create exposure if a single circuit underperforms, so pair aggressive circuit plays with diversification tests and a net contribution check.
 
 ```{python}
 # Distributor by Circuit
@@ -724,20 +829,15 @@ fig.update_layout(
 fig.show()
 ```
 
+-> Mindblowing, Tolly Movies and Forum Distribution dominate Hoyts and also perform strongly at Event and Village, while circuits like United, Reading and ICA contribute very little for most distributors. 
+
+**Recommendation**: Prioritise targeted partnerships and pilots with the circuits that already convert well for each distributor, and run controlled tests in underperforming circuits to determine whether low revenue is due to supply or demand. Treat concentrated wins as both an opportunity and a risk because they can deliver fast returns but create exposure if a single circuit underperforms, so pair aggressive circuit plays with diversification tests and a net contribution check.
+
 ## Theatre level: volume and efficiency
+Building on the idea of regional variation, I then moved from distributors to the locations themselves and examined how individual theatres perform in terms of volume and efficiency.
 
-Building on this idea of regional variation, I then moved from distributors to the locations themselves and examined how individual theatres perform in terms of volume and efficiency.
-
-The bubble chart shows three dimensions of performance across states, cities and theatres. The horizontal axis shows volume, measured as the sum of each film’s longest continuous run days at the location. The vertical axis shows efficiency, measured as average daily revenue computed as total revenue divided by run‑based days. Bubble size reflects total revenue and colour indicates state.
-
-2 distinct opportunity types emerge:
-
-- **Premium event screens (IMAX) sit in the upper left:** they post extremely high average daily revenue but run far fewer days. However, they also come with higher costs and limited flexibility. Therefore, these screens are best used for tentpoles and premium releases rather than regular expansion.
-
-- **Scalable high-efficiency theatres sit in the upper right:** they combine high daily revenue with long runs and therefore offer the best, repeatable upside from adding days or improving showtimes.
-
--> **Recommendation**: Prioritise adding screens and improving showtimes at high efficiency theatres, treat premium formats as a separate planning bucket for tentpoles, and focus further analysis on upper right theatres to identify repeatable patterns that make them successful.
-
+::::: {layout = "[70,30]"}
+::: {#firstcolumn}
 ```{python}
 # Metrics
 cinema_stats = df_run.groupby(['state','city','theatre_name' ]).agg(
@@ -781,6 +881,20 @@ fig.add_vline(x=median_volume, line_dash="dash", line_color="gray", annotation_t
 fig.show()
 ```
 
+:::
+::: {#secondcolumn}
+
+The bubble chart shows three dimensions of performance across states, cities and theatres. The horizontal axis shows volume, measured as the sum of each film’s longest continuous run days at the location. The vertical axis shows efficiency, measured as average daily revenue computed as total revenue divided by run‑based days. Bubble size reflects total revenue and colour indicates state.
+
+:::
+:::::
+
+2 distinct opportunity types emerge:
+
+- **Premium event screens (IMAX) sit in the upper left:** they post extremely high average daily revenue but run far fewer days. However, they also come with higher costs and limited flexibility. Therefore, these screens are best used for tentpoles and premium releases rather than regular expansion.
+
+- **Scalable high-efficiency theatres sit in the upper right:** they combine high daily revenue with long runs and therefore offer the best, repeatable upside from adding days or improving showtimes.
+
 ```{python}
 # Location
 pd.set_option('display.max_rows', None)
@@ -794,12 +908,25 @@ cinema_stats_sort = cinema_stats.sort_values('total_gross', ascending=False)
 grand_total = cinema_stats_sort['total_gross'].sum()
 cinema_stats_sort['percent_share'] = (cinema_stats_sort['total_gross'] / grand_total) * 100
 
-display(
-    cinema_stats_sort.head(10).style.format({
-        'total_gross': '${:,.0f}',
-        'avg_daily_gross': '${:,.0f}',
-        'percent_share': '{:.2f}%'
-    })
-)
+cinema_stats_sort = cinema_stats_sort.reset_index(drop=True)
+
+cinema_stats_sort.rename(columns={
+    'theatre_name': 'Theatre',
+    'city': 'City',
+    'state': 'State',
+    'total_gross': 'Total gross (raw)',
+    'avg_daily_gross': 'Avg daily gross (raw)',
+    'percent_share': 'Share (%)'
+}, inplace=True)
+
+cinema_stats_sort['Total gross ($)'] = cinema_stats_sort['Total gross (raw)'].apply(lambda v: f"${v/1e6:,.1f}M")
+cinema_stats_sort['Avg daily gross ($)'] = cinema_stats_sort['Avg daily gross (raw)'].apply(lambda v: f"${v:,.0f}")
+cinema_stats_sort['Share (%)'] = cinema_stats_sort['Share (%)'].apply(lambda v: f"{v:.2f}%" if pd.notna(v) else "")
+
+cols = ['Theatre','City','State','Total gross ($)','Avg daily gross ($)','Share (%)']
+caption = "Top theatres by total gross and efficiency."
+html = cinema_stats_sort[cols].head(20).to_html(index=False, escape=False)
+display(HTML(f"<div><strong>{caption}</strong></div>" + html))
 ```
 
+**Recommendation**: Prioritise adding screens and improving showtimes at high efficiency theatres, treat premium formats as a separate planning bucket for tentpoles, and focus further analysis on upper right theatres to identify repeatable patterns that make them successful.
