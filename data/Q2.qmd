@@ -142,7 +142,7 @@ daily.loc[daily['run_lifetime'] == 0, 'cum_share'] = np.nan
 ```
 
 
-::::: {layout = "[20,80]"}
+::::: {layout = "[70,30]"}
 ::: {#firstcolumn}
 
 ```{python}
@@ -188,9 +188,6 @@ fig.update_layout(
     xaxis_title='Day since first sale',
     yaxis_title='Median daily gross',
     template='plotly_white',
-    width=900,
-    height=420,
-    margin=dict(l=60, r=40, t=60, b=60),
     hoverlabel=dict(bgcolor='white', font_size=12)
 )
 
@@ -213,7 +210,7 @@ When aligned to first sale the median daily gross peaks on day 2 and then falls 
 
 To understand why these patterns emerge at the daily level, the next step is to look at day to day retention. Day to day retention measures how much a film earns on day t relative to day t minus 1. A median retention at or above 1 means the typical film is holding or growing, while a median below 1 signals decay.
 
-::::: {layout = "[20,80]"}
+::::: {layout = "[70,30]"}
 ::: {#firstcolumn}
 
 ```{python}
@@ -255,7 +252,7 @@ fig.update_xaxes(title='Day since first sale', tickmode='array', tickvals=days)
 fig.update_yaxes(range=[0, 2.5], title='Retention (Day n / Day n-1)')
 fig.update_layout(
     title='Distribution of day-to-day retention ratios',
-    template='plotly_white', width=1000, height=420, margin=dict(l=60, r=70, t=70, b=60))
+    template='plotly_white')
 fig.show()
 ```
 
@@ -273,7 +270,7 @@ Median retention falls quickly in the first days and the median drops below 1 wi
 
 Next, I used Kaplan Meier (KM) to estimate the probability a film is still running on each day since its first positive gross, treating the longest continuous segment as the run and accounting for censoring. The KM curve gives a robust view of run longevity while the median cumulative share line shows how quickly revenue is captured.
 
-::::: {layout = "[20,80]"}
+::::: {layout = "[70,30]"}
 ::: {#firstcolumn}
 
 ```{python}
@@ -362,10 +359,7 @@ fig.update_yaxes(title_text='Median cumulative share', range=[0, 1.05], secondar
 fig.update_layout(
     title='Film Survival (KM) and Median Cumulative Revenue Capture',
     template='plotly_white',
-    width=1100,
-    height=500,
-    legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
-    margin=dict(l=60, r=60, t=80, b=60)
+    legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1)
 )
 
 fig.show()
@@ -386,7 +380,7 @@ The KM survival curve drops steeply in the early days and reaches the 50% mark a
 
 However, earlier results from question 1 pointed to an upper bound near day 14, so I rechecked using the longest continuous run and median cumulative share. 
 
-::::: {layout = "[20,80]"}
+::::: {layout = "[70,30]"}
 ::: {#firstcolumn}
 
 
@@ -428,9 +422,6 @@ fig.update_layout(
     xaxis_title='Day since first sale',
     yaxis_title='Median marginal gain',
     template='plotly_white',
-    width=900,
-    height=420,
-    margin=dict(l=60, r=40, t=70, b=60),
     legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1)
 )
 
@@ -538,10 +529,7 @@ fig.update_yaxes(title_text='ECDF', range=[0, 1.02])
 
 fig.update_layout(
     title=f'ECDF of incremental dollars (d={d} to d+6={d+6})', 
-    template='plotly_white',
-    width=900,
-    height=420,
-    margin=dict(l=60, r=20, t=70, b=60)
+    template='plotly_white'
 )
 
 fig.show()
@@ -551,3 +539,5 @@ fig.show()
 
 ## Summary
 Taken together, the evidence supports a default run of 20 days, with early clearance at 14 days for clear underperformers and extensions to max 40 days only for films that show strong momentum or are top openers. It may help to make every decision conditional and auditable by defining numeric thresholds.
+
+[Back: Table of contents](exploration.html) · [Next: Q3](Q3.html)

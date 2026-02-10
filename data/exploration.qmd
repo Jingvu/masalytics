@@ -12,8 +12,17 @@ echo: false
 warning: false
 ---
 
+
 # Overview
 The first step of this project is a structured exploration of the 2025 Indian box office dataset to understand its shape, clean the inputs, and establish the basic patterns in demand. This includes a set of overview visualisations that help detect seasonality, weekly behaviour, blockbuster effects, and early signals in distributor and location performance. These foundations give us the clarity we need before moving into deeper insights and answering the key business questions for Film Viet Australia.
+
+# Table of Contents
+
+- [Initial Exploration](exploration.html)  
+- [Question 1 - Speed Of Revenue Capture](Q1.html)  
+- [Question 2 - Optimal Run Length](Q2.html)  
+- [Question 3 - Window Vulnerability](Q3.html)
+
 
 # Visualization
 ```{python}
@@ -930,3 +939,5 @@ display(HTML(f"<div><strong>{caption}</strong></div>" + html))
 ```
 
 **Recommendation**: Prioritise adding screens and improving showtimes at high efficiency theatres, treat premium formats as a separate planning bucket for tentpoles, and focus further analysis on upper right theatres to identify repeatable patterns that make them successful.
+
+[Next: Q1](Q1.html)

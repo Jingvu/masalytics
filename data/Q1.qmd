@@ -213,7 +213,7 @@ summary_top = res_top['summary_state'].copy()
 
 This plot shows the empirical cumulative distribution of days to reach 50 % of scaled lifetime gross for mid market films. Each line is a state and the vertical axis shows the proportion of films that have hit the 50 percent milestone by each day since first sale. 
 
-::::: {layout = "[20,80]"}
+::::: {layout = "[30,70]"}
 ::: {#firstcolumn}
 
 ```{python}
@@ -270,7 +270,7 @@ The lines for New South Wales and Victoria climb steeply in the first few days. 
 :::
 :::::
 
-::::: {layout = "[20,80]"}
+::::: {layout = "[30,70]"}
 ::: {#firstcolumn}
 
 ```{python}
@@ -325,7 +325,7 @@ Top titles show greater variability. In New South Wales the median time to reach
 
 The boxplot below complements that by helping us summarize the same data so we can see how consistent that timing is within each state
 
-::::: {layout = "[20,80]"}
+::::: {layout = "[30,70]"}
 ::: {#firstcolumn}
 
 
@@ -365,7 +365,7 @@ In the mid market, New South Wales and Western Australia show short medians and 
 :::
 :::::
 
-::::: {layout = "[20,80]"}
+::::: {layout = "[30,70]"}
 ::: {#firstcolumn}
  
 
@@ -404,7 +404,7 @@ For the next step, scatter plots were used to add the next layer by showing how 
 
 The plot below shows a scatter of days to reach 50% against opening screen average for mid market films. Each point is a film and points are colored by state. 
 
-::::: {layout = "[20,80]"}
+::::: {layout = "[30,70]"}
 ::: {#firstcolumn}
 
 ```{python}
@@ -470,7 +470,7 @@ The takeaway is using opening screen average alone is not enough, it must be com
 A clear split also appears in the data. Many films reach 50% within the first 4 days, while a smaller group does not get there until around day 9, with only some fall in the middle. This pattern supports using a standard programming window for most titles, while keeping targeted holds for the slow burners that show improving per screen performance.
 
 
-::::: {layout = "[20,80]"}
+::::: {layout = "[30,70]"}
 ::: {#firstcolumn}
 
 
@@ -531,7 +531,7 @@ For the top market, the hits are spread across a much wider range of days and op
 
 ## Days to reach 80%
 
-::::: {layout = "[20,80]"}
+::::: {layout = "[30,70]"}
 ::: {#firstcolumn}
 
 ```{python}
@@ -583,7 +583,7 @@ For the 80% milestone, the same approach is used. The mid market films follow a 
 :::
 :::::
 
-::::: {layout = "[20,80]"}
+::::: {layout = "[30,70]"}
 ::: {#firstcolumn}
 
 
@@ -635,7 +635,7 @@ The top market behaves differently. The biggest titles show a much wider spread 
 :::
 :::::
 
-::::: {layout = "[20,80]"}
+::::: {layout = "[30,70]"}
 ::: {#firstcolumn}
 
 ```{python}
@@ -664,7 +664,7 @@ Looking at the boxplots for the mid market group, the medians cluster tightly ar
 :::
 :::::
 
-::::: {layout = "[20,80]"}
+::::: {layout = "[30,70]"}
 ::: {#firstcolumn}
 
 
@@ -701,7 +701,7 @@ The top market boxplots highlight how uneven the big titles can be. New South Wa
 
 The scatter plot for the mid market group adds another layer by showing how opening strength relates to the time it takes to reach 80%. Most films reach the milestone within the first week, and they span a wide range of opening screen averages. 
 
-::::: {layout = "[20,80]"}
+::::: {layout = "[30,70]"}
 ::: {#firstcolumn}
 
 
@@ -759,9 +759,9 @@ A few titles take longer despite modest openings, pointing again to slow burners
 :::
 :::::
 
-<br><br>
+<br>
 
-::::: {layout = "[20,80]"}
+::::: {layout = "[30,70]"}
 ::: {#firstcolumn}
 
 
@@ -823,3 +823,5 @@ Most mid market films earn the majority of their revenue very quickly. Half of t
 Top market films behave differently. The time they need to reach milestones are far more spread out, and some hits take many weeks to reach 80% regardless of how strong their opening is. Their broader and more sustained audience segments, combined with factors like premium formats, repeat viewing, and staggered rollouts, create longer tails that break the mid market pattern.
 
 Taken together, the data show that most films generate the bulk of their revenue in the first week, while big hits require more flexible and case by case treatment.
+
+[Back: Table of contents](exploration.html) · [Next: Q2](Q2.html)
